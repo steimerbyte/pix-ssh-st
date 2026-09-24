@@ -52,7 +52,6 @@ import { getUnattendedMode, withAgentBlock } from "@xynogen/pix-runtime";
 import { type CollapseState, tickCollapse } from "@xynogen/pix-runtime/collapse";
 import { Type } from "typebox";
 import {
-	APPROVAL_TTL_MS,
 	commandEscalatesPrivilege,
 	controlPathFor,
 	detectSshFailure,
@@ -62,6 +61,7 @@ import {
 	type HostSpec,
 	hostApproved,
 	hostTarget,
+	markHostApproved,
 	MAX_OUTPUT_BYTES,
 	MAX_OUTPUT_LINES,
 	parseHost,
@@ -76,6 +76,8 @@ import {
 	type TransferDirection,
 	transferApprovalDecision,
 	truncate,
+	SESSION_APPROVAL_TTL_MS,
+	SUDO_APPROVAL_TTL_MS,
 } from "./lib.ts";
 
 const PROMPT_TIMEOUT_MS = 60_000;
@@ -90,13 +92,16 @@ interface HostCreds {
 }
 const credCache = new Map<string, HostCreds>();
 
-// Per-host allow-memory (on by default): once the user approves any command on
-// a host, later calls to that host skip the confirm overlay until the approval
-// expires — mirroring sudo's PAM ticket window (~15 min), not the whole session.
+// Per-host allow-memory (fork policy):
+//   - `approvedHosts` covers NON-privileged commands and never expires for the
+//     life of the Pi session (Infinity). One Allow per host per session.
+//   - `approvedSudoHosts` covers PRIVILEGED commands (`sudo:true` or any
+//     sudo/su/doas/pkexec token in the command text). 30-min rolling window.
 // Password prompts are NOT skipped — a still-missing login or sudo password
 // always re-prompts. Each auto-approve emits a visible notify so the decision is
-// never silent. Map value = epoch ms when the approval lapses (see APPROVAL_TTL_MS).
+// never silent. Maps never leave process memory (process exit clears them).
 const approvedHosts = new Map<string, number>();
+const approvedSudoHosts = new Map<string, number>();
 
 function cacheKey(spec: HostSpec): string {
 	return `${spec.user ?? ""}@${spec.host}:${spec.port ?? 22}`;
@@ -599,17 +604,23 @@ export default function (pi: ExtensionAPI): void {
 			// passwords without connecting, so validatePassword just accepts a
 			// non-empty entry; a wrong password surfaces as an auth error after run.
 			// Session allow-memory: host already approved + no password missing → skip
-			// the confirm overlay entirely (visible notify below). Privileged commands
-			// (sudo:true, or a sudo/su/doas/pkexec token in the command text) are never
-			// auto-approved — they always re-confirm.
+			// the confirm overlay entirely (visible notify below).
+			//
+			// Fork change:
+			//   - Privileged commands now use the SEPARATE `approvedSudoHosts` map
+			//     (30-min rolling window). They are not always re-confirmed.
+			//   - Non-privileged commands use `approvedHosts` with `Infinity` TTL
+			//     → approved once per session, never again.
 			const privileged = action === "command" && (sudo || commandEscalatesPrivilege(command));
+			const sessionAlive = hostApproved(approvedHosts, key, Date.now(), SESSION_APPROVAL_TTL_MS);
+			const sudoAlive = hostApproved(approvedSudoHosts, key, Date.now(), SUDO_APPROVAL_TTL_MS);
 			const alreadyApproved =
 				action === "command" &&
-				!privileged &&
-				hostApproved(approvedHosts, key) &&
-				promptFor.length === 0;
+				promptFor.length === 0 &&
+				(privileged ? sudoAlive : sessionAlive);
 			if (alreadyApproved) {
-				ctx.ui.notify(`ssh_run: reused session approval for ${host}`, "info");
+				const kind = privileged ? "sudo (30-min)" : "session";
+				ctx.ui.notify(`ssh_run: reused ${kind} approval for ${host}`, "info");
 			} else if (transferDecision === "allow") {
 				ctx.ui.notify(
 					`⚠ ssh_run file transfer auto-approved — ${mode.toUpperCase()} warning policy`,
@@ -698,7 +709,16 @@ export default function (pi: ExtensionAPI): void {
 
 			// File transfers remain warning-level: normal mode asks every time,
 			// AFK denies above, and YOLO may approve when no password is missing.
-			if (action === "command") approvedHosts.set(key, Date.now() + APPROVAL_TTL_MS);
+			// Command runs: record approval in the matching window.
+			//   - non-privileged → session map, Infinity TTL (once per session)
+			//   - privileged     → sudo map, 30-min rolling
+			if (action === "command") {
+				if (privileged) {
+					markHostApproved(approvedSudoHosts, key, Date.now(), SUDO_APPROVAL_TTL_MS);
+				} else {
+					markHostApproved(approvedHosts, key, Date.now(), SESSION_APPROVAL_TTL_MS);
+				}
+			}
 
 			// Persist newly-entered passwords in the session cache.
 			const loginPassword = creds.loginPassword ?? collected.login;

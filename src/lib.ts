@@ -22,14 +22,43 @@ import { isAbsolute, join, resolve as resolvePath } from "node:path";
 export const MAX_OUTPUT_BYTES = 50 * 1024;
 export const MAX_OUTPUT_LINES = 2000;
 
-/** Per-host approval TTL (ms) — mirrors sudo's PAM ticket window (~15 min). */
-export const APPROVAL_TTL_MS = 15 * 60_000;
+/**
+ * Approval TTLs (ms) — pix-ssh-st fork.
+ *
+ * - `SESSION_APPROVAL_TTL_MS`: for NON-privileged commands the user has approved
+ *   once, the in-process Map never expires the entry (`+Infinity`), so the
+ *   overlay is skipped for the rest of the Pi session. Approving a `whoami` on
+ *   `deploy@host` covers every later non-privileged call on that same host
+ *   until Pi exits — there is no rolling 15-min window like upstream.
+ * - `SUDO_APPROVAL_TTL_MS`: for sudo-style calls a SEPARATE map uses a rolling
+ *   30-min window per host. Re-approving extends the window. Set true on each
+ *   privileged run that follows its own overlay.
+ *
+ * Fork change vs `xynogen/pix-ssh@v0.5.2`:
+ *   - non-privileged: per-session (was 15 min rolling)
+ *   - privileged: 30 min rolling (new map; was always re-prompted via
+ *     `commandEscalatesPrivilege`/`sudo:true` short-circuit)
+ *
+ * Both windows are per `(user@host:port)` cache key and never persisted.
+ */
+export const SESSION_APPROVAL_TTL_MS = Number.POSITIVE_INFINITY;
+export const SUDO_APPROVAL_TTL_MS = 30 * 60_000;
 
 /**
  * True when `key` has a live (non-expired) approval in `map`; deletes the entry
- * on expiry so the map self-prunes. `now` is injectable for tests.
+ * on expiry so the map self-prunes. `now` and `ttlMs` are injectable for tests.
+ *
+ * TTL semantics:
+ *   - finite positive TTL → entry stores its expiry epoch, checked against `now`
+ *   - `Number.POSITIVE_INFINITY` TTL → entry stores `Infinity` and is always live
+ *     for the life of the in-process Map (process exit self-clears it)
  */
-export function hostApproved(map: Map<string, number>, key: string, now = Date.now()): boolean {
+export function hostApproved(
+	map: Map<string, number>,
+	key: string,
+	now = Date.now(),
+	ttlMs: number = SESSION_APPROVAL_TTL_MS,
+): boolean {
 	const expiry = map.get(key);
 	if (expiry === undefined) return false;
 	if (now >= expiry) {
@@ -37,6 +66,20 @@ export function hostApproved(map: Map<string, number>, key: string, now = Date.n
 		return false;
 	}
 	return true;
+}
+
+/**
+ * Mark `key` approved. If `ttlMs` is finite, store the absolute expiry epoch;
+ * otherwise store `Infinity` so the entry stays live until process exit (no
+ * prune work needed).
+ */
+export function markHostApproved(
+	map: Map<string, number>,
+	key: string,
+	now = Date.now(),
+	ttlMs: number = SESSION_APPROVAL_TTL_MS,
+): void {
+	map.set(key, ttlMs === Number.POSITIVE_INFINITY ? Number.POSITIVE_INFINITY : now + ttlMs);
 }
 
 /**

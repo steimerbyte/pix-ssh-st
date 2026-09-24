@@ -1,7 +1,7 @@
 {
-	"name": "@xynogen/pix-ssh",
-	"version": "0.5.2",
-	"description": "Pi tool — ssh_run: run remote commands over SSH with password/key auth and remote sudo",
+	"name": "@steimerbyte/pix-ssh-st",
+	"version": "0.1.0",
+	"description": "Pi tool — ssh_run with fork policy: approve once per session (non-privileged) + 30-min rolling window for sudo commands.",
 	"type": "module",
 	"main": "src/index.ts",
 	"scripts": {
@@ -26,13 +26,16 @@
 		"sudo",
 		"remote"
 	],
-	"author": "xynogen",
+	"author": "steimerbyte",
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/xynogen/pix-mono.git",
-		"directory": "packages/pix-ssh"
+		"url": "git+https://github.com/steimerbyte/pix-ssh-st.git"
 	},
+	"bugs": {
+		"url": "https://github.com/steimerbyte/pix-ssh-st/issues"
+	},
+	"homepage": "https://github.com/steimerbyte/pix-ssh-st#readme",
 	"publishConfig": {
 		"access": "public"
 	},
