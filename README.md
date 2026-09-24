@@ -31,7 +31,7 @@ Registers the `ssh_run` tool — run a command through the configured SSH shell 
 ## Install
 
 ```bash
-pi install npm:@steimerbyte/pix-ssh-st
+pi install git:github.com/steimerbyte/pix-ssh-st@v0.1.0
 ```
 
 Standalone/opt-in — **not** bundled by `pix-core`. Replace `@xynogen/pix-ssh` in `~/.pi/agent/settings.json` with this name; remove the upstream entry.
