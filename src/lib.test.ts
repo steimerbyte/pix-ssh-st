@@ -4,6 +4,7 @@ import registerSsh, { validatorFor } from "./index.ts";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createRuntime } from "@xynogen/pix-runtime";
 import {
 	type ApprovalEntry,
 	baseScpArgs,
@@ -590,6 +591,27 @@ describe("capStream", () => {
 });
 
 describe("ssh result renderer", () => {
+	// The renderer's collapsed branch is gated by `shouldCollapse("ssh")`, which
+	// reads the global pix-runtime singleton. A user's pix.json can disable
+	// collapse globally (enabled: false), so without swapping in an isolated
+	// runtime that uses the defaults, `tickCollapse` returns false and the
+	// collapsed row path is never exercised — even though the test seeds
+	// `state.collapsed = true`. Swap the singleton for these tests so they
+	// observe the real collapse code path under its default config
+	// (enabled: true, delaySec: 10).
+	const SINGLETON_KEY = Symbol.for("@xynogen/pix-runtime");
+	let originalRuntime: unknown;
+	let agentDir: string;
+	beforeEach(() => {
+		originalRuntime = (globalThis as Record<symbol, unknown>)[SINGLETON_KEY];
+		agentDir = mkdtempSync(join(tmpdir(), "pix-ssh-st-collapse-"));
+		(globalThis as Record<symbol, unknown>)[SINGLETON_KEY] = createRuntime({ agentDir });
+	});
+	afterEach(() => {
+		(globalThis as Record<symbol, unknown>)[SINGLETON_KEY] = originalRuntime;
+		rmSync(agentDir, { recursive: true, force: true });
+	});
+
 	const theme = {
 		fg: (key: string, text: string) => `[${key}]${text}[/]`,
 		bold: (text: string) => text,
