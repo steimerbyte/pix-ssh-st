@@ -609,7 +609,7 @@ export default function (pi: ExtensionAPI): void {
 			// can't probe yet, so fall back to prompting for the sudo password.
 			const sudoNoPassword =
 				sudo && !creds.sudoPassword && !needLogin && (keyOk || Boolean(creds.loginPassword))
-					? await probeSudoNoPassword(spec, controlPath, sig)
+					? await probeSudoNoPassword(spec, controlPath, command, sig)
 					: false;
 			const needSudo = sudo && !creds.sudoPassword && !sudoNoPassword;
 			// The overlay stage pipeline: any password we still need is prompted

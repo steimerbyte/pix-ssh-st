@@ -61,6 +61,12 @@ export function hostApproved(
 ): boolean {
 	const expiry = map.get(key);
 	if (expiry === undefined) return false;
+	// Guard NaN: any comparison with NaN is false, so without this check a
+	// NaN-tagged entry would be treated as live forever and never pruned.
+	if (!Number.isFinite(expiry)) {
+		map.delete(key);
+		return false;
+	}
 	if (now >= expiry) {
 		map.delete(key);
 		return false;
@@ -89,7 +95,13 @@ export function markHostApproved(
  * (`… && sudo …`).
  */
 export function commandEscalatesPrivilege(command: string): boolean {
-	return /(^|[\s;&|(])(sudo|su|doas|pkexec)\b/.test(command);
+	// Boundary class covers whitespace, semicolons, pipes, redirects,
+	// backticks, single/double quotes, curly braces, square brackets,
+	// and path separators (full/relative path invocation). Without the
+	// extra classes, `` `sudo cmd` ``, `'sudo cmd'`, `/usr/bin/sudo cmd`,
+	// `./sudo cmd`, `{sudo cmd}`, `[sudo cmd]` all bypassed detection.
+	// Case-insensitive so `SUDO=1 sudo cmd` is still caught.
+	return /(^|[\s;&|`'\"{}\[\]\/(])(sudo|su|doas|pkexec)\b/i.test(command);
 }
 
 // ── Local config override ────────────────────────────────────────────────────
@@ -264,8 +276,12 @@ export function parseHost(spec: string): HostSpec {
 }
 
 function parsePort(value: string): number {
-	const n = Number.parseInt(value, 10);
-	if (!Number.isInteger(n) || n < 1 || n > 65535) {
+	const trimmed = value.trim();
+	const n = Number.parseInt(trimmed, 10);
+	// Strict check: parseInt("22extra") returns 22 silently. Require the
+	// trimmed input to round-trip as a decimal integer literal so trailing
+	// garbage is rejected instead of silently accepting a partial port.
+	if (!Number.isInteger(n) || n < 1 || n > 65535 || String(n) !== trimmed) {
 		throw new Error(`Invalid port: ${value}`);
 	}
 	return n;
@@ -564,6 +580,35 @@ export function filterSudoPrompt(raw: string): string {
 
 // ── Output truncation ────────────────────────────────────────────────────────
 
+/**
+	 * Roll back to the last valid UTF-8 boundary inside a Buffer subarray.
+	 * Required because `Buffer.subarray(0, n)` keeps raw bytes — if n lands
+	 * mid-codepoint, `toString("utf8")` injects U+FFFD for the partial
+	 * sequence. A 4-byte emoji cut at byte 50 produces a string with a
+	 * replacement char; rolling back the trailing continuation bytes
+	 * gives a clean truncation.
+	 */
+function sliceAtUtf8Boundary(buf: Buffer, maxBytes: number): number {
+	let end = Math.min(maxBytes, buf.length);
+	// 0b10xxxxxx is a continuation byte; back up while we see them so the
+	// preceding byte (a lead byte) is followed by its full codepoint.
+	while (end > 0 && (buf[end] & 0xc0) === 0x80) end--;
+	// If we walked back to within a lead byte that has no room for its
+	// sequence, drop the lead byte too. (Lead bytes are 0xxxxxxx or
+	// 11xxxxxx; ASCII lead (0xxxxxxx) is fine to keep.)
+	if (end > 0) {
+		const lead = buf[end - 1];
+		if ((lead & 0x80) !== 0) {
+			// Multi-byte lead: figure out expected length from the first byte.
+			const expectedLen =
+				(lead & 0xe0) === 0xc0 ? 2 : (lead & 0xf0) === 0xe0 ? 3 : (lead & 0xf8) === 0xf0 ? 4 : 1;
+			const have = buf.length - (end - 1);
+			if (have < expectedLen) end--;
+		}
+	}
+	return end;
+}
+
 export function truncate(
 	text: string,
 	maxLines = MAX_OUTPUT_LINES,
@@ -577,7 +622,9 @@ export function truncate(
 	const kept = lines.slice(0, maxLines);
 	let result = kept.join("\n");
 	if (Buffer.byteLength(result, "utf8") > maxBytes) {
-		result = Buffer.from(result, "utf8").subarray(0, maxBytes).toString("utf8");
+		const buf = Buffer.from(result, "utf8");
+		const safeEnd = sliceAtUtf8Boundary(buf, maxBytes);
+		result = buf.subarray(0, safeEnd).toString("utf8");
 	}
 	return { text: result, truncated: true };
 }
@@ -670,15 +717,21 @@ export function probePasswordAuth(
 }
 
 /**
- * Probe whether remote sudo runs without a password (NOPASSWD sudoers) via
- * `sudo -n true`. Returns true when no sudo password is needed. Requires a
- * passwordless SSH connection (key/agent/existing-master or a cached login
- * password) — the probe opens its own channel with `BatchMode=yes`, so callers
- * must only probe when SSH login auth already succeeds without prompting.
+ * Probe whether remote sudo runs without a password (NOPASSWD sudoers).
+ * Probes with the ACTUAL command wrapped via shellQuote rather than the
+ * generic `sudo -n true` — sudoers rules are command-specific
+ * (`deploy ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart nginx`), so a
+ * true-probe would false-negative and trigger an overlay prompt for a
+ * NOPASSWD-only command. Returns true when no sudo password is needed
+ * for this command. Requires a passwordless SSH connection (key/agent
+ * /existing-master or a cached login password) — the probe opens its
+ * own channel with `BatchMode=yes`, so callers must only probe when
+ * SSH login auth already succeeds without prompting.
  */
 export function probeSudoNoPassword(
 	spec: HostSpec,
 	controlPath: string,
+	command: string,
 	signal?: AbortSignal,
 ): Promise<boolean> {
 	const args = [
@@ -686,7 +739,7 @@ export function probeSudoNoPassword(
 		"-o",
 		"BatchMode=yes",
 		hostTarget(spec),
-		"sudo -n true",
+		`sudo -n -- sh -c ${shellQuote(command)}`,
 	];
 	return new Promise((resolve) => {
 		const proc = spawn("ssh", args, { stdio: ["ignore", "ignore", "ignore"] });
@@ -808,12 +861,23 @@ function signal(
 	proc: ReturnType<typeof spawn>,
 	reject: (e: Error) => void,
 ): void {
-	sig?.addEventListener(
-		"abort",
-		() => {
-			proc.kill("SIGTERM");
-			reject(new Error("Cancelled"));
-		},
-		{ once: true },
-	);
+	if (!sig) return;
+	let killed = false;
+	const handler = () => {
+		if (killed) return;
+		killed = true;
+		// Try graceful first; if the child ignores SIGTERM (stuck in a 3rd-party
+		// binary, ControlMaster socket, etc.) escalate to SIGKILL after 5s.
+		proc.kill("SIGTERM");
+		setTimeout(() => {
+			if (!proc.killed) proc.kill("SIGKILL");
+		}, 5000);
+		// Distinct error so the caller can render "cancelled by abort" instead
+		// of generic "Cancelled".
+		reject(new Error("aborted by signal"));
+	};
+	sig.addEventListener("abort", handler, { once: true });
+	// Drop the listener once the child exits naturally so long-lived signals
+	// don't accumulate listeners across many spawn calls.
+	proc.once("close", () => sig.removeEventListener("abort", handler));
 }
