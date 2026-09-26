@@ -52,29 +52,43 @@ export const SESSION_APPROVAL_TTL_MS = Number.POSITIVE_INFINITY;
 export const SUDO_APPROVAL_TTL_MS = 30 * 60_000;
 
 /**
- * True when `key` has a live (non-expired) approval in `map`; deletes the entry
- * on expiry so the map self-prunes. `now` and `ttlMs` are injectable for tests.
+ * Per-host approval entry. Replaces the old `Map<string, number>` shape that
+ * overloaded one field with two meanings (Infinity = session-scoped, finite
+ * epoch = TTL deadline). The discriminated variant makes each case explicit
+ * and removes the need for the caller to remember which sentinel means which.
  *
- * TTL semantics:
- *   - finite positive TTL → entry stores its expiry epoch, checked against `now`
- *   - `Number.POSITIVE_INFINITY` TTL → entry stores `Infinity` and is always live
- *     for the life of the in-process Map (process exit self-clears it)
+ * - `kind: "ttl"` → entry expires at `expiresAt` epoch (ms since epoch).
+ * - `kind: "session"` → entry stays live until process exit; no expiry field,
+ *   so there is nothing to compare and nothing to self-prune.
+ */
+export type ApprovalEntry =
+	| { kind: "ttl"; expiresAt: number }
+	| { kind: "session"; sessionScoped: true };
+
+/**
+ * True when `key` has a live (non-expired) approval in `map`; deletes the entry
+ * on expiry so the map self-prunes. `now` is injectable for tests.
+ *
+ * Semantics:
+ *   - `kind: "session"` → always live for the life of the in-process Map
+ *     (process exit self-clears it). No epoch to compare.
+ *   - `kind: "ttl"` → entry expires at `expiresAt`, checked against `now`.
  */
 export function hostApproved(
-	map: Map<string, number>,
+	map: Map<string, ApprovalEntry>,
 	key: string,
 	now = Date.now(),
-	ttlMs: number = SESSION_APPROVAL_TTL_MS,
 ): boolean {
-	const expiry = map.get(key);
-	if (expiry === undefined) return false;
+	const entry = map.get(key);
+	if (entry === undefined) return false;
+	if (entry.kind === "session") return true;
 	// Guard NaN: any comparison with NaN is false, so without this check a
 	// NaN-tagged entry would be treated as live forever and never pruned.
-	if (!Number.isFinite(expiry)) {
+	if (!Number.isFinite(entry.expiresAt)) {
 		map.delete(key);
 		return false;
 	}
-	if (now >= expiry) {
+	if (now >= entry.expiresAt) {
 		map.delete(key);
 		return false;
 	}
@@ -82,17 +96,21 @@ export function hostApproved(
 }
 
 /**
- * Mark `key` approved. If `ttlMs` is finite, store the absolute expiry epoch;
- * otherwise store `Infinity` so the entry stays live until process exit (no
- * prune work needed).
+ * Mark `key` approved. Converts the input `ttlMs` into the typed variant:
+ *   - `Number.POSITIVE_INFINITY` → `{ kind: "session" }` (live until process exit)
+ *   - finite positive TTL → `{ kind: "ttl", expiresAt: now + ttlMs }`
  */
 export function markHostApproved(
-	map: Map<string, number>,
+	map: Map<string, ApprovalEntry>,
 	key: string,
 	now = Date.now(),
 	ttlMs: number = SESSION_APPROVAL_TTL_MS,
 ): void {
-	map.set(key, ttlMs === Number.POSITIVE_INFINITY ? Number.POSITIVE_INFINITY : now + ttlMs);
+	if (ttlMs === Number.POSITIVE_INFINITY) {
+		map.set(key, { kind: "session", sessionScoped: true });
+	} else {
+		map.set(key, { kind: "ttl", expiresAt: now + ttlMs });
+	}
 }
 
 /**

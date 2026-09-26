@@ -7382,21 +7382,26 @@ var MAX_OUTPUT_BYTES = 50 * 1024;
 var MAX_OUTPUT_LINES = 2e3;
 var SESSION_APPROVAL_TTL_MS = Number.POSITIVE_INFINITY;
 var SUDO_APPROVAL_TTL_MS = 30 * 6e4;
-function hostApproved(map, key, now = Date.now(), ttlMs = SESSION_APPROVAL_TTL_MS) {
-  const expiry = map.get(key);
-  if (expiry === void 0) return false;
-  if (!Number.isFinite(expiry)) {
+function hostApproved(map, key, now = Date.now()) {
+  const entry = map.get(key);
+  if (entry === void 0) return false;
+  if (entry.kind === "session") return true;
+  if (!Number.isFinite(entry.expiresAt)) {
     map.delete(key);
     return false;
   }
-  if (now >= expiry) {
+  if (now >= entry.expiresAt) {
     map.delete(key);
     return false;
   }
   return true;
 }
 function markHostApproved(map, key, now = Date.now(), ttlMs = SESSION_APPROVAL_TTL_MS) {
-  map.set(key, ttlMs === Number.POSITIVE_INFINITY ? Number.POSITIVE_INFINITY : now + ttlMs);
+  if (ttlMs === Number.POSITIVE_INFINITY) {
+    map.set(key, { kind: "session", sessionScoped: true });
+  } else {
+    map.set(key, { kind: "ttl", expiresAt: now + ttlMs });
+  }
 }
 function commandEscalatesPrivilege(command) {
   return /(^|[\s;&|`'\"{}\[\]\/(])(sudo|su|doas|pkexec)\b/i.test(command);
@@ -8284,8 +8289,8 @@ function index_default(pi) {
       ];
       const collected = {};
       const privileged = action === "command" && (sudo || commandEscalatesPrivilege(command));
-      const sessionAlive = hostApproved(approvedHosts, key, Date.now(), SESSION_APPROVAL_TTL_MS);
-      const sudoAlive = hostApproved(approvedSudoHosts, key, Date.now(), SUDO_APPROVAL_TTL_MS);
+      const sessionAlive = hostApproved(approvedHosts, key);
+      const sudoAlive = hostApproved(approvedSudoHosts, key);
       const sudoOnlyNoPrompt = promptFor.length === 1 && promptFor[0] === "sudo" && sshRunConfig.sudoConfirm === false;
       const configFullAutoAllow = sshRunConfig.confirm === false && sshRunConfig.sudoConfirm === false;
       const alreadyApproved = action === "command" && (configFullAutoAllow || promptFor.length === 0 || sudoOnlyNoPrompt) && (configFullAutoAllow || !sshRunConfig.confirm || (privileged ? sudoAlive : sessionAlive));

@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	type ApprovalEntry,
 	baseScpArgs,
 	baseSshArgs,
 	buildRunSshArgs,
@@ -17,6 +18,7 @@ import {
 	filterSudoPrompt,
 	hostApproved,
 	hostTarget,
+	markHostApproved,
 	isUnreachable,
 	loadSshConfig,
 	parseHost,
@@ -306,13 +308,41 @@ describe("hostApproved", () => {
 		expect(hostApproved(new Map(), "u@h:22")).toBe(false);
 	});
 	it("is true within the TTL window", () => {
-		const m = new Map([["u@h:22", 1000]]);
+		const m = new Map<string, ApprovalEntry>([["u@h:22", { kind: "ttl", expiresAt: 1000 }]]);
 		expect(hostApproved(m, "u@h:22", 500)).toBe(true);
 	});
 	it("expires and self-prunes at/after the deadline", () => {
-		const m = new Map([["u@h:22", 1000]]);
+		const m = new Map<string, ApprovalEntry>([["u@h:22", { kind: "ttl", expiresAt: 1000 }]]);
 		expect(hostApproved(m, "u@h:22", 1000)).toBe(false);
 		expect(m.has("u@h:22")).toBe(false);
+	});
+	it("session-scoped entry is live indefinitely (no expiry field)", () => {
+		const m = new Map<string, ApprovalEntry>([
+			["u@h:22", { kind: "session", sessionScoped: true }],
+		]);
+		// Past the typical TTL horizon — must still be live.
+		expect(hostApproved(m, "u@h:22", Number.MAX_SAFE_INTEGER)).toBe(true);
+		expect(m.has("u@h:22")).toBe(true);
+	});
+	it("NaN-tagged ttl entry is treated as dead and self-prunes", () => {
+		// Mirrors the v0.2.0 NaN guard: any comparison with NaN is false,
+		// so without the guard a NaN-tagged entry would live forever.
+		const m = new Map<string, ApprovalEntry>([["u@h:22", { kind: "ttl", expiresAt: Number.NaN }]]);
+		expect(hostApproved(m, "u@h:22", 0)).toBe(false);
+		expect(m.has("u@h:22")).toBe(false);
+	});
+});
+
+describe("markHostApproved", () => {
+	it("stores a session variant for Infinity TTL", () => {
+		const m = new Map<string, ApprovalEntry>();
+		markHostApproved(m, "u@h:22", 0, Number.POSITIVE_INFINITY);
+		expect(m.get("u@h:22")).toEqual({ kind: "session", sessionScoped: true });
+	});
+	it("stores a ttl variant with absolute expiry for finite TTL", () => {
+		const m = new Map<string, ApprovalEntry>();
+		markHostApproved(m, "u@h:22", 1_000, 30 * 60_000);
+		expect(m.get("u@h:22")).toEqual({ kind: "ttl", expiresAt: 1_000 + 30 * 60_000 });
 	});
 });
 

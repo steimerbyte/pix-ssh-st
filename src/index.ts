@@ -60,6 +60,7 @@ import {
 	commandEscalatesPrivilege,
 	controlPathFor,
 	detectSshFailure,
+	type ApprovalEntry,
 	detectSudoFailure,
 	type HostAlias,
 	type HostInfo,
@@ -121,8 +122,8 @@ const credCache = new Map<string, HostCreds>();
 //                    pro Session (non-priv) bzw. 30-min Rolling (sudo).
 const sshRunConfig = loadSshConfig();
 setIdentityFileOverride(sshRunConfig.defaultIdentityFile);
-const approvedHosts = new Map<string, number>();
-const approvedSudoHosts = new Map<string, number>();
+const approvedHosts = new Map<string, ApprovalEntry>();
+const approvedSudoHosts = new Map<string, ApprovalEntry>();
 
 function cacheKey(spec: HostSpec): string {
 	return `${spec.user ?? ""}@${spec.host}:${spec.port ?? 22}`;
@@ -719,8 +720,8 @@ export default function (pi: ExtensionAPI): void {
 			//   - Non-privileged commands use `approvedHosts` with `Infinity` TTL
 			//     → approved once per session, never again.
 			const privileged = action === "command" && (sudo || commandEscalatesPrivilege(command));
-			const sessionAlive = hostApproved(approvedHosts, key, Date.now(), SESSION_APPROVAL_TTL_MS);
-			const sudoAlive = hostApproved(approvedSudoHosts, key, Date.now(), SUDO_APPROVAL_TTL_MS);
+			const sessionAlive = hostApproved(approvedHosts, key);
+			const sudoAlive = hostApproved(approvedSudoHosts, key);
 			// sudoConfirm: false → masked sudo-password overlay skipped when no
 			// other prompt is outstanding. Pair this with NOPASSWD sudo on the
 			// remote (or `sudoNoPassword` will detect it) so promptFor stays
