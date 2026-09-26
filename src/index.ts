@@ -966,11 +966,25 @@ ctx.ui.notify(`🔐 Remote sudo authentication failed on ${host}`, "error");
 				.replace(/^\n+|\n+$/g, "");
 
 			// Completion notify — short signal so long-running calls are easier to
-			// spot in the stream. Severity mirrors the exit code.
+			// spot in the stream. Severity mirrors the exit code. On non-zero exit,
+			// include the first non-empty stderr line as a hint so the user can tell
+			// "exit 127" (command not found) from "exit 1" (auth/refusal) without
+			// opening the tool result. Truncate to 100 chars + strip control bytes.
+			const stderrHint = result.stderr
+				.split("\n")
+				.map((l) => l.trim())
+				.find((l) => l.length > 0);
+			const cleanHint = stderrHint
+				? stderrHint
+						.replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")
+						.replace(/\s+/g, " ")
+						.slice(0, 100)
+				: "";
+			const failureLine = cleanHint
+				? `⚠ ssh_run exit ${result.code} on ${host} — ${cleanHint}`
+				: `⚠ ssh_run exit ${result.code} on ${host}`;
 			ctx.ui.notify(
-				result.code === 0
-					? `✓ ssh_run completed on ${host}`
-					: `⚠ ssh_run exited ${result.code} on ${host}`,
+				result.code === 0 ? `✓ ssh_run completed on ${host}` : failureLine,
 				result.code === 0 ? "info" : "warning",
 			);
 			return {

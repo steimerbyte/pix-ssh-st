@@ -8428,8 +8428,11 @@ ${result.stderr}` }],
 
 [Output truncated to ${MAX_OUTPUT_LINES} lines / ${MAX_OUTPUT_BYTES / 1024}KB]` : "";
       const rendered = normalizeLineEndings(combined).replace(/\n{3,}/g, "\n\n").replace(/^\n+|\n+$/g, "");
+      const stderrHint = result.stderr.split("\n").map((l) => l.trim()).find((l) => l.length > 0);
+      const cleanHint = stderrHint ? stderrHint.replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").replace(/\s+/g, " ").slice(0, 100) : "";
+      const failureLine = cleanHint ? `\u26A0 ssh_run exit ${result.code} on ${host} \u2014 ${cleanHint}` : `\u26A0 ssh_run exit ${result.code} on ${host}`;
       ctx.ui.notify(
-        result.code === 0 ? `\u2713 ssh_run completed on ${host}` : `\u26A0 ssh_run exited ${result.code} on ${host}`,
+        result.code === 0 ? `\u2713 ssh_run completed on ${host}` : failureLine,
         result.code === 0 ? "info" : "warning"
       );
       return {
