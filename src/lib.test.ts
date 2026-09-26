@@ -182,7 +182,9 @@ describe("buildRunSshArgs", () => {
 describe("transfer unattended approval", () => {
 	it("treats transfer as warning-level in AFK and YOLO", () => {
 		expect(transferApprovalDecision("off", false)).toBe("ask");
-		expect(transferApprovalDecision("afk", false)).toBe("allow");
+		// AFK denies transfers even when a login password is cached — matches
+		// the command path which always denies under AFK (audit UX/UI HIGH fix).
+		expect(transferApprovalDecision("afk", false)).toBe("deny");
 		expect(transferApprovalDecision("yolo", false)).toBe("allow");
 	});
 

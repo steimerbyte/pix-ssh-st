@@ -221,6 +221,10 @@ export function transferApprovalDecision(
 	loginPasswordMissing: boolean,
 ): "ask" | "allow" | "deny" {
 	if (mode === "off") return "ask";
+		// AFK: user is away — never auto-approve a transfer (mirrors command
+		// path which already denies on AFK). YOLO/AFK+OOPasswordMissing → deny.
+		if (mode === "afk") return "deny";
+		return loginPasswordMissing ? "deny" : "allow";
 	return loginPasswordMissing ? "deny" : "allow";
 }
 

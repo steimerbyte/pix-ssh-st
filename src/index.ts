@@ -286,7 +286,9 @@ function updatePresentation(
 function terminalMeta(details: SshResultDetails): string {
 	if (details.outcome === "denied") return "denied";
 	if (details.outcome === "timed-out") return "timed out";
-	if (details.outcome === "cancelled") return "cancelled";
+	if (details.outcome === "cancelled") {
+		return details.cancellationKind === "missing-password" ? "no password" : "cancelled";
+	}
 	if (details.errorKind === "no-ui") return "interactive session required";
 	if (details.errorKind === "auth-ssh") return "ssh auth failed";
 	if (details.errorKind === "auth-sudo") return "sudo auth failed";
@@ -294,7 +296,7 @@ function terminalMeta(details: SshResultDetails): string {
 
 	const hasLines = typeof details.lineCount === "number" && details.lineCount > 0;
 	return dotJoin([
-		typeof details.exitCode === "number" && `exit ${details.exitCode}`,
+		typeof details.exitCode === "number" ? `failed exit ${details.exitCode}` : "failed",
 		hasLines && `${details.lineCount} ${details.lineCount === 1 ? "line" : "lines"}`,
 		details.truncated && "truncated",
 	]);
@@ -323,8 +325,8 @@ function cancelResult(
 		outcome === "timed-out"
 			? "Timed out — auto-denied."
 			: outcome === "denied"
-				? "Denied by user."
-				: "Cancelled — no password entered.";
+"Denied by user or password attempts exhausted."
+"No password entered."
 	return {
 		content: [{ type: "text", text: `Cancelled — ${msg}` }],
 		details: makeDetails(command, host, sudo, reason, { outcome, cancellationKind }),
@@ -369,6 +371,13 @@ function formatAliasList(aliases: HostAlias[]): string {
  * given, otherwise the alias inventory from ~/.ssh/config. Read-only.
  * Details carry `_type: "sshInfo"` so renderResult falls to its generic
  * plain-text branch (no collapse, no exit-code framing). */
+// Tiny notification bridge so infoResult (called without ctx) can still
+// emit a completion toast. Bound by execute before the call.
+let _infoNotify: ((msg: string) => void) | undefined;
+function bindInfoNotify(notifyFn: (msg: string) => void): void {
+	_infoNotify = notifyFn;
+}
+
 async function infoResult(host: string | undefined, sig?: AbortSignal) {
 	const details = { _type: "sshInfo" as const };
 	if (host?.trim()) {
@@ -384,10 +393,14 @@ async function infoResult(host: string | undefined, sig?: AbortSignal) {
 			};
 		}
 		const text = formatHostInfo(hostTarget(spec), await resolveHostInfo(spec, sig));
+		_infoNotify?.(`info: resolved ${spec.user ? spec.user + "@" : ""}${spec.host}`);
 		return { content: [{ type: "text" as const, text }], details };
 	}
+	const aliasCount = readSshConfigAliases().length;
+	const text = formatAliasList(readSshConfigAliases());
+	_infoNotify?.(`info: ${aliasCount} host aliases listed`);
 	return {
-		content: [{ type: "text" as const, text: formatAliasList(readSshConfigAliases()) }],
+		content: [{ type: "text" as const, text }],
 		details,
 	};
 }
@@ -475,6 +488,9 @@ export default function (pi: ExtensionAPI): void {
 		async execute(_toolCallId, params, sig, onUpdate, ctx) {
 			// info: read-only SSH config report (no connection, no approval).
 			if (params.action === "info") {
+				// infoResult needs ctx.ui for the completion notify; bind a tiny shim
+				// so the read-only path can still emit a single low-priority toast.
+				bindInfoNotify((m) => ctx.ui.notify(`ssh_run: ${m}`, "info"));
 				return infoResult(params.host, sig);
 			}
 
@@ -502,6 +518,18 @@ export default function (pi: ExtensionAPI): void {
 					isError: true,
 				};
 			}
+			if (action === "file" && !direction) {
+				// Pre-flight guard: missing direction silently defaulted to "upload"
+				// (data-loss risk). Fail loudly so the model fixes its call shape.
+				return {
+					content: [{ type: "text", text: 'ssh_run failed: direction ("upload"|"download") is required when action is "file"' }],
+					details: makeDetails(command, params.host, false, reason, {
+						outcome: "error",
+						errorKind: "execution",
+					}),
+					isError: true,
+				};
+			}
 
 			if (action === "command" && !command.trim()) {
 				return {
@@ -520,7 +548,8 @@ export default function (pi: ExtensionAPI): void {
 			} catch (err) {
 				const msg = err instanceof Error ? err.message : String(err);
 				return {
-					content: [{ type: "text", text: `ssh_run failed: ${msg}` }],
+					// Include the original spec in the error so the user sees what was rejected.
+					content: [{ type: "text", text: `ssh_run failed: invalid host "${params.host}" — ${msg}` }],
 					details: makeDetails(command, params.host, sudo, reason, {
 						outcome: "error",
 						errorKind: "execution",
@@ -541,6 +570,7 @@ export default function (pi: ExtensionAPI): void {
 			const mode = getUnattendedMode(pi.events);
 			const yolo = mode === "yolo";
 			if (action === "command" && mode === "afk") {
+				ctx.ui.notify("ssh_run denied: AFK mode blocks remote commands", "info");
 				return {
 					content: [{ type: "text", text: "ssh_run denied immediately — AFK mode is active." }],
 					details: makeDetails(command, host, sudo, reason, {
@@ -663,7 +693,10 @@ export default function (pi: ExtensionAPI): void {
 				} else {
 					kind = "session";
 				}
-				ctx.ui.notify(`ssh_run: auto allow turned on via ${kind} — ${host}`, "info");
+				// sudo (30-min) reuse is a security-relevant signal — surface as warning
+			// so it does not drown in the info stream. Config + session stay info.
+			const notifySeverity = kind === "sudo (30-min)" ? "warning" : "info";
+			ctx.ui.notify(`ssh_run: auto allow turned on via ${kind} — ${host}`, notifySeverity);
 				// TUI: when config auto-allows, skip the "Awaiting approval…" message
 				// in the result pane by jumping straight to "running" with the
 				// auto-allow kind in the text. The later updatePresentation call
@@ -681,7 +714,7 @@ export default function (pi: ExtensionAPI): void {
 				}
 			} else if (transferDecision === "allow") {
 				ctx.ui.notify(
-					`⚠ ssh_run file transfer auto-approved — ${mode.toUpperCase()} warning policy`,
+					`⚠ ssh_run file transfer — YOLO mode auto-approved`,
 					"warning",
 				);
 			}
@@ -837,18 +870,22 @@ export default function (pi: ExtensionAPI): void {
 							});
 			} catch (err) {
 				const msg = err instanceof Error ? err.message : String(err);
+				// Distinguish plugin-aborted runs from generic spawn failures so the
+				// user sees "cancelled by abort" instead of the raw "Cancelled" / ENOENT.
+				const aborted = sig?.aborted === true;
+				const prefix = aborted ? "ssh_run cancelled" : "ssh_run failed";
 				return {
-					content: [{ type: "text", text: `ssh_run failed: ${msg}` }],
+					content: [{ type: "text", text: `${prefix} on ${host}: ${msg}` }],
 					details: makeDetails(
 						command,
 						host,
 						sudo,
 						reason,
-						sig?.aborted
+						aborted
 							? { outcome: "cancelled", cancellationKind: "aborted" }
 							: { outcome: "error", errorKind: "execution" },
 					),
-					isError: sig?.aborted !== true,
+					isError: !aborted,
 				};
 			} finally {
 				if (spinnerTimer) clearInterval(spinnerTimer);
@@ -869,7 +906,7 @@ export default function (pi: ExtensionAPI): void {
 			// next call re-prompts.
 			if (detectSshFailure(result.code, result.stderr)) {
 				credCache.delete(key);
-				ctx.ui.notify("🔐 SSH authentication failed", "error");
+ctx.ui.notify(`🔐 SSH authentication failed for ${host}`, "error");
 				return {
 					content: [{ type: "text", text: `SSH authentication failed:\n${result.stderr}` }],
 					details: makeDetails(command, host, sudo, reason, {
@@ -886,7 +923,7 @@ export default function (pi: ExtensionAPI): void {
 			// Remote sudo password failure → drop the bad sudo password.
 			if (sudo && detectSudoFailure(result.stderr)) {
 				credCache.set(key, loginPassword ? { loginPassword } : {});
-				ctx.ui.notify("🔐 Remote sudo authentication failed", "error");
+ctx.ui.notify(`🔐 Remote sudo authentication failed on ${host}`, "error");
 				return {
 					content: [{ type: "text", text: `Remote sudo authentication failed:\n${result.stderr}` }],
 					details: makeDetails(command, host, sudo, reason, {
@@ -909,6 +946,14 @@ export default function (pi: ExtensionAPI): void {
 				.replace(/\n{3,}/g, "\n\n")
 				.replace(/^\n+|\n+$/g, "");
 
+			// Completion notify — short signal so long-running calls are easier to
+			// spot in the stream. Severity mirrors the exit code.
+			ctx.ui.notify(
+				result.code === 0
+					? `✓ ssh_run completed on ${host}`
+					: `⚠ ssh_run exited ${result.code} on ${host}`,
+				result.code === 0 ? "info" : "warning",
+			);
 			return {
 				content: [{ type: "text", text: `Exit code: ${result.code}\n\n${truncatedText}${suffix}` }],
 				details: makeDetails(command, host, sudo, reason, {
