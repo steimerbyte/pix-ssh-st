@@ -7374,6 +7374,10 @@ import { createHash } from "node:crypto";
 import { globSync, readFileSync as readFileSync5 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join as join5, resolve as resolvePath } from "node:path";
+var SSH_BIN = "ssh";
+var SCP_BIN = "scp";
+var SSHPASS_BIN = "sshpass";
+var SSHPASS_ENV = "SSHPASS";
 var MAX_OUTPUT_BYTES = 50 * 1024;
 var MAX_OUTPUT_LINES = 2e3;
 var SESSION_APPROVAL_TTL_MS = Number.POSITIVE_INFINITY;
@@ -7381,6 +7385,10 @@ var SUDO_APPROVAL_TTL_MS = 30 * 6e4;
 function hostApproved(map, key, now = Date.now(), ttlMs = SESSION_APPROVAL_TTL_MS) {
   const expiry = map.get(key);
   if (expiry === void 0) return false;
+  if (!Number.isFinite(expiry)) {
+    map.delete(key);
+    return false;
+  }
   if (now >= expiry) {
     map.delete(key);
     return false;
@@ -7391,7 +7399,7 @@ function markHostApproved(map, key, now = Date.now(), ttlMs = SESSION_APPROVAL_T
   map.set(key, ttlMs === Number.POSITIVE_INFINITY ? Number.POSITIVE_INFINITY : now + ttlMs);
 }
 function commandEscalatesPrivilege(command) {
-  return /(^|[\s;&|(])(sudo|su|doas|pkexec)\b/.test(command);
+  return /(^|[\s;&|`'\"{}\[\]\/(])(sudo|su|doas|pkexec)\b/i.test(command);
 }
 var DEFAULT_SSH_RUN_CONFIG = {
   confirm: true
@@ -7419,7 +7427,9 @@ function loadSshConfig(path = DEFAULT_SSH_RUN_CONFIG_PATH) {
     return DEFAULT_SSH_RUN_CONFIG;
   }
   const obj = parsed;
-  if (!("confirm" in obj)) return DEFAULT_SSH_RUN_CONFIG;
+  if (!("confirm" in obj) && !("defaultIdentityFile" in obj) && !("sudoConfirm" in obj)) {
+    return DEFAULT_SSH_RUN_CONFIG;
+  }
   if (typeof obj.confirm !== "boolean") {
     process.stderr.write(`ssh_run: ignoring ${path} \u2014 "confirm" must be boolean
 `);
@@ -7449,6 +7459,8 @@ var CONTROL_PERSIST_SECONDS = 120;
 var CONNECT_TIMEOUT_SECONDS = 10;
 function transferApprovalDecision(mode, loginPasswordMissing) {
   if (mode === "off") return "ask";
+  if (mode === "afk") return "deny";
+  return loginPasswordMissing ? "deny" : "allow";
   return loginPasswordMissing ? "deny" : "allow";
 }
 function parseHost(spec) {
@@ -7473,13 +7485,21 @@ function parseHost(spec) {
     const [h, p] = rest.split(":");
     rest = h ?? "";
     port = parsePort(p ?? "");
+  } else if (colons > 1) {
   }
   if (!rest) throw new Error(`Invalid host: ${spec}`);
+  if (colons > 1 && rest.split(":").length > 2) {
+    process.stderr.write(
+      `ssh_run: host "${rest}" looks like a bare IPv6 with a port \u2014 use [${rest}]:22 form to disambiguate
+`
+    );
+  }
   return { user, host: rest, ...port !== void 0 ? { port } : {} };
 }
 function parsePort(value) {
-  const n = Number.parseInt(value, 10);
-  if (!Number.isInteger(n) || n < 1 || n > 65535) {
+  const trimmed = value.trim();
+  const n = Number.parseInt(trimmed, 10);
+  if (!Number.isInteger(n) || n < 1 || n > 65535 || String(n) !== trimmed) {
     throw new Error(`Invalid port: ${value}`);
   }
   return n;
@@ -7500,7 +7520,7 @@ function resolveSshHost(spec, signal2) {
   args.push(hostTarget(spec));
   return new Promise((resolve) => {
     let stdout = "";
-    const proc = spawn2("ssh", args, { stdio: ["ignore", "pipe", "ignore"] });
+    const proc = spawn2(SSH_BIN, args, { stdio: ["ignore", "pipe", "ignore"] });
     proc.stdout.on("data", (chunk) => {
       stdout += chunk.toString();
     });
@@ -7591,7 +7611,7 @@ function resolveHostInfo(spec, signal2) {
   args.push(hostTarget(spec));
   return new Promise((resolve) => {
     let stdout = "";
-    const proc = spawn2("ssh", args, { stdio: ["ignore", "pipe", "ignore"] });
+    const proc = spawn2(SSH_BIN, args, { stdio: ["ignore", "pipe", "ignore"] });
     proc.stdout.on("data", (c) => {
       stdout += c.toString();
     });
@@ -7663,6 +7683,19 @@ function detectSudoFailure(stderr) {
 function filterSudoPrompt(raw) {
   return raw.split("\n").filter((l) => !/^\s*(\[sudo\] )?password( for .*)?:?\s*$/i.test(l)).join("\n");
 }
+function sliceAtUtf8Boundary(buf, maxBytes) {
+  let end = Math.min(maxBytes, buf.length);
+  while (end > 0 && (buf[end] & 192) === 128) end--;
+  if (end > 0) {
+    const lead = buf[end - 1];
+    if ((lead & 128) !== 0) {
+      const expectedLen = (lead & 224) === 192 ? 2 : (lead & 240) === 224 ? 3 : (lead & 248) === 240 ? 4 : 1;
+      const have = buf.length - (end - 1);
+      if (have < expectedLen) end--;
+    }
+  }
+  return end;
+}
 function truncate(text, maxLines = MAX_OUTPUT_LINES, maxBytes = MAX_OUTPUT_BYTES) {
   const lines = text.split("\n");
   const byteLen = Buffer.byteLength(text, "utf8");
@@ -7672,7 +7705,9 @@ function truncate(text, maxLines = MAX_OUTPUT_LINES, maxBytes = MAX_OUTPUT_BYTES
   const kept = lines.slice(0, maxLines);
   let result = kept.join("\n");
   if (Buffer.byteLength(result, "utf8") > maxBytes) {
-    result = Buffer.from(result, "utf8").subarray(0, maxBytes).toString("utf8");
+    const buf = Buffer.from(result, "utf8");
+    const safeEnd = sliceAtUtf8Boundary(buf, maxBytes);
+    result = buf.subarray(0, safeEnd).toString("utf8");
   }
   return { text: result, truncated: true };
 }
@@ -7680,7 +7715,7 @@ function probeKeyAuth(spec, controlPath, signal2) {
   const args = [...baseSshArgs(spec, controlPath), "-o", "BatchMode=yes", hostTarget(spec), "true"];
   return new Promise((resolve) => {
     let stderr = "";
-    const proc = spawn2("ssh", args, { stdio: ["ignore", "ignore", "pipe"] });
+    const proc = spawn2(SSH_BIN, args, { stdio: ["ignore", "ignore", "pipe"] });
     proc.stderr.on("data", (c) => {
       stderr += c.toString();
     });
@@ -7711,9 +7746,9 @@ function probePasswordAuth(spec, controlPath, password, signal2) {
   ];
   return new Promise((resolve) => {
     let stderr = "";
-    const proc = spawn2("sshpass", args, {
+    const proc = spawn2(SSHPASS_BIN, args, {
       stdio: ["ignore", "ignore", "pipe"],
-      env: { ...process.env, SSHPASS: password }
+      env: { ...process.env, [SSHPASS_ENV]: password }
     });
     proc.stderr.on("data", (c) => {
       stderr += c.toString();
@@ -7727,16 +7762,16 @@ function probePasswordAuth(spec, controlPath, password, signal2) {
     signal2?.addEventListener("abort", () => proc.kill("SIGTERM"), { once: true });
   });
 }
-function probeSudoNoPassword(spec, controlPath, signal2) {
+function probeSudoNoPassword(spec, controlPath, command, signal2) {
   const args = [
     ...baseSshArgs(spec, controlPath),
     "-o",
     "BatchMode=yes",
     hostTarget(spec),
-    "sudo -n true"
+    `sudo -n -- sh -c ${shellQuote(command)}`
   ];
   return new Promise((resolve) => {
-    const proc = spawn2("ssh", args, { stdio: ["ignore", "ignore", "ignore"] });
+    const proc = spawn2(SSH_BIN, args, { stdio: ["ignore", "ignore", "ignore"] });
     proc.on("error", () => resolve(false));
     proc.on("close", (code) => resolve(code === 0));
     signal2?.addEventListener("abort", () => proc.kill("SIGTERM"), { once: true });
@@ -7748,9 +7783,9 @@ function isUnreachable(stderr) {
 }
 function runTransfer(spec, direction, source, destination, recursive, opts) {
   const endpoint = ["--", ...transferArgs(spec, direction, source, destination)];
-  const bin = opts.loginPassword ? "sshpass" : "scp";
+  const bin = opts.loginPassword ? SSHPASS_BIN : SCP_BIN;
   const args = opts.loginPassword ? ["-e", "scp", ...baseScpArgs(spec, opts.controlPath, recursive), ...endpoint] : [...baseScpArgs(spec, opts.controlPath, recursive), "-o", "BatchMode=yes", ...endpoint];
-  const env = opts.loginPassword ? { ...process.env, SSHPASS: opts.loginPassword } : process.env;
+  const env = opts.loginPassword ? { ...process.env, [SSHPASS_ENV]: opts.loginPassword } : process.env;
   return spawnResult(bin, args, env, opts.signal);
 }
 function buildRunSshArgs(spec, command, opts) {
@@ -7763,7 +7798,7 @@ function buildRunSshArgs(spec, command, opts) {
 }
 function runSsh(spec, command, opts) {
   const { bin, args } = buildRunSshArgs(spec, command, opts);
-  const env = opts.loginPassword ? { ...process.env, SSHPASS: opts.loginPassword } : process.env;
+  const env = opts.loginPassword ? { ...process.env, [SSHPASS_ENV]: opts.loginPassword } : process.env;
   const stdin = opts.sudo && opts.sudoPassword !== void 0 ? `${opts.sudoPassword}
 ` : void 0;
   return spawnResult(bin, args, env, opts.signal, opts.sudo ? filterSudoPrompt : void 0, stdin);
@@ -7788,14 +7823,19 @@ function spawnResult(bin, args, env, sig, filterStderr, stdin) {
   });
 }
 function signal(sig, proc, reject) {
-  sig?.addEventListener(
-    "abort",
-    () => {
-      proc.kill("SIGTERM");
-      reject(new Error("Cancelled"));
-    },
-    { once: true }
-  );
+  if (!sig) return;
+  let killed = false;
+  const handler = () => {
+    if (killed) return;
+    killed = true;
+    proc.kill("SIGTERM");
+    setTimeout(() => {
+      if (!proc.killed) proc.kill("SIGKILL");
+    }, 5e3);
+    reject(new Error("aborted by signal"));
+  };
+  sig.addEventListener("abort", handler, { once: true });
+  proc.once("close", () => sig.removeEventListener("abort", handler));
 }
 
 // src/index.ts
@@ -7884,14 +7924,16 @@ function updatePresentation(onUpdate, command, host, sudo, reason, outcome, mess
 function terminalMeta(details) {
   if (details.outcome === "denied") return "denied";
   if (details.outcome === "timed-out") return "timed out";
-  if (details.outcome === "cancelled") return "cancelled";
+  if (details.outcome === "cancelled") {
+    return details.cancellationKind === "missing-password" ? "no password" : "cancelled";
+  }
   if (details.errorKind === "no-ui") return "interactive session required";
   if (details.errorKind === "auth-ssh") return "ssh auth failed";
   if (details.errorKind === "auth-sudo") return "sudo auth failed";
   if (details.errorKind === "execution" || details.errorKind === "no-result") return "failed";
   const hasLines = typeof details.lineCount === "number" && details.lineCount > 0;
   return dotJoin([
-    typeof details.exitCode === "number" && `exit ${details.exitCode}`,
+    typeof details.exitCode === "number" ? `failed exit ${details.exitCode}` : "failed",
     hasLines && `${details.lineCount} ${details.lineCount === 1 ? "line" : "lines"}`,
     details.truncated && "truncated"
   ]);
@@ -7900,9 +7942,32 @@ function isTerminal(details) {
   return details.outcome !== "awaiting-approval" && details.outcome !== "running";
 }
 function cancelResult(command, host, sudo, reason, action) {
-  const cancellationKind = action === "timeout" ? "timeout" : action === "denied" ? "denied" : "missing-password";
-  const outcome = cancellationKind === "timeout" ? "timed-out" : cancellationKind === "denied" ? "denied" : "cancelled";
-  const msg = outcome === "timed-out" ? "Timed out \u2014 auto-denied." : outcome === "denied" ? "Denied by user." : "Cancelled \u2014 no password entered.";
+  let cancellationKind;
+  let outcome;
+  let msg;
+  switch (action) {
+    case "timeout":
+      cancellationKind = "timeout";
+      outcome = "timed-out";
+      msg = "Timed out \u2014 auto-denied.";
+      break;
+    case "denied":
+      cancellationKind = "denied";
+      outcome = "denied";
+      msg = "Denied by user or password attempts exhausted.";
+      break;
+    case "approved":
+      cancellationKind = "missing-password";
+      outcome = "cancelled";
+      msg = "No password entered.";
+      break;
+    default: {
+      const _exhaustive = action;
+      cancellationKind = "missing-password";
+      outcome = "cancelled";
+      msg = `Cancelled \u2014 ${String(_exhaustive)}`;
+    }
+  }
   return {
     content: [{ type: "text", text: `Cancelled \u2014 ${msg}` }],
     details: makeDetails(command, host, sudo, reason, { outcome, cancellationKind })
@@ -7939,6 +8004,10 @@ function formatAliasList(aliases) {
   }
   return [`SSH host aliases (${lines.length}):`, ...lines].join("\n");
 }
+var _infoNotify;
+function bindInfoNotify(notifyFn) {
+  _infoNotify = notifyFn;
+}
 async function infoResult(host, sig) {
   const details = { _type: "sshInfo" };
   if (host?.trim()) {
@@ -7953,11 +8022,15 @@ async function infoResult(host, sig) {
         isError: true
       };
     }
-    const text = formatHostInfo(hostTarget(spec), await resolveHostInfo(spec, sig));
-    return { content: [{ type: "text", text }], details };
+    const text2 = formatHostInfo(hostTarget(spec), await resolveHostInfo(spec, sig));
+    _infoNotify?.(`info: resolved ${spec.user ? spec.user + "@" : ""}${spec.host}`);
+    return { content: [{ type: "text", text: text2 }], details };
   }
+  const aliasCount = readSshConfigAliases().length;
+  const text = formatAliasList(readSshConfigAliases());
+  _infoNotify?.(`info: ${aliasCount} host aliases listed`);
   return {
-    content: [{ type: "text", text: formatAliasList(readSshConfigAliases()) }],
+    content: [{ type: "text", text }],
     details
   };
 }
@@ -8024,6 +8097,7 @@ function index_default(pi) {
     }),
     async execute(_toolCallId, params, sig, onUpdate, ctx) {
       if (params.action === "info") {
+        bindInfoNotify((m) => ctx.ui.notify(`ssh_run: ${m}`, "info"));
         return infoResult(params.host, sig);
       }
       if (!params.host?.trim()) {
@@ -8048,6 +8122,16 @@ function index_default(pi) {
           isError: true
         };
       }
+      if (action === "file" && !direction) {
+        return {
+          content: [{ type: "text", text: 'ssh_run failed: direction ("upload"|"download") is required when action is "file"' }],
+          details: makeDetails(command, params.host, false, reason, {
+            outcome: "error",
+            errorKind: "execution"
+          }),
+          isError: true
+        };
+      }
       if (action === "command" && !command.trim()) {
         return {
           content: [{ type: "text", text: "ssh_run failed: command is required" }],
@@ -8064,7 +8148,8 @@ function index_default(pi) {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return {
-          content: [{ type: "text", text: `ssh_run failed: ${msg}` }],
+          // Include the original spec in the error so the user sees what was rejected.
+          content: [{ type: "text", text: `ssh_run failed: invalid host "${params.host}" \u2014 ${msg}` }],
           details: makeDetails(command, params.host, sudo, reason, {
             outcome: "error",
             errorKind: "execution"
@@ -8080,6 +8165,7 @@ function index_default(pi) {
       const mode = getUnattendedMode(pi.events);
       const yolo = mode === "yolo";
       if (action === "command" && mode === "afk") {
+        ctx.ui.notify("ssh_run denied: AFK mode blocks remote commands", "info");
         return {
           content: [{ type: "text", text: "ssh_run denied immediately \u2014 AFK mode is active." }],
           details: makeDetails(command, host, sudo, reason, {
@@ -8104,7 +8190,7 @@ function index_default(pi) {
       const probe = creds.loginPassword ? "ok" : await probeKeyAuth(spec, controlPath, sig);
       const keyOk = probe === "ok";
       const needLogin = probe === "auth" && !creds.loginPassword;
-      const sudoNoPassword = sudo && !creds.sudoPassword && !needLogin && (keyOk || Boolean(creds.loginPassword)) ? await probeSudoNoPassword(spec, controlPath, sig) : false;
+      const sudoNoPassword = sudo && !creds.sudoPassword && !needLogin && (keyOk || Boolean(creds.loginPassword)) ? await probeSudoNoPassword(spec, controlPath, command, sig) : false;
       const needSudo = sudo && !creds.sudoPassword && !sudoNoPassword;
       const promptFor = [
         ...needLogin ? ["login"] : [],
@@ -8147,7 +8233,8 @@ function index_default(pi) {
         } else {
           kind = "session";
         }
-        ctx.ui.notify(`ssh_run: auto allow turned on via ${kind} \u2014 ${host}`, "info");
+        const notifySeverity = kind === "sudo (30-min)" ? "warning" : "info";
+        ctx.ui.notify(`ssh_run: auto allow turned on via ${kind} \u2014 ${host}`, notifySeverity);
         if (!sshRunConfig.confirm) {
           updatePresentation(
             onUpdate,
@@ -8161,7 +8248,7 @@ function index_default(pi) {
         }
       } else if (transferDecision === "allow") {
         ctx.ui.notify(
-          `\u26A0 ssh_run file transfer auto-approved \u2014 ${mode.toUpperCase()} warning policy`,
+          `\u26A0 ssh_run file transfer \u2014 YOLO mode auto-approved`,
           "warning"
         );
       }
@@ -8277,16 +8364,18 @@ function index_default(pi) {
         });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
+        const aborted = sig?.aborted === true;
+        const prefix = aborted ? "ssh_run cancelled" : "ssh_run failed";
         return {
-          content: [{ type: "text", text: `ssh_run failed: ${msg}` }],
+          content: [{ type: "text", text: `${prefix} on ${host}: ${msg}` }],
           details: makeDetails(
             command,
             host,
             sudo,
             reason,
-            sig?.aborted ? { outcome: "cancelled", cancellationKind: "aborted" } : { outcome: "error", errorKind: "execution" }
+            aborted ? { outcome: "cancelled", cancellationKind: "aborted" } : { outcome: "error", errorKind: "execution" }
           ),
-          isError: sig?.aborted !== true
+          isError: !aborted
         };
       } finally {
         if (spinnerTimer) clearInterval(spinnerTimer);
@@ -8303,7 +8392,7 @@ function index_default(pi) {
       }
       if (detectSshFailure(result.code, result.stderr)) {
         credCache.delete(key);
-        ctx.ui.notify("\u{1F510} SSH authentication failed", "error");
+        ctx.ui.notify(`\u{1F510} SSH authentication failed for ${host}`, "error");
         return {
           content: [{ type: "text", text: `SSH authentication failed:
 ${result.stderr}` }],
@@ -8319,7 +8408,7 @@ ${result.stderr}` }],
       }
       if (sudo && detectSudoFailure(result.stderr)) {
         credCache.set(key, loginPassword ? { loginPassword } : {});
-        ctx.ui.notify("\u{1F510} Remote sudo authentication failed", "error");
+        ctx.ui.notify(`\u{1F510} Remote sudo authentication failed on ${host}`, "error");
         return {
           content: [{ type: "text", text: `Remote sudo authentication failed:
 ${result.stderr}` }],
@@ -8339,6 +8428,10 @@ ${result.stderr}` }],
 
 [Output truncated to ${MAX_OUTPUT_LINES} lines / ${MAX_OUTPUT_BYTES / 1024}KB]` : "";
       const rendered = normalizeLineEndings(combined).replace(/\n{3,}/g, "\n\n").replace(/^\n+|\n+$/g, "");
+      ctx.ui.notify(
+        result.code === 0 ? `\u2713 ssh_run completed on ${host}` : `\u26A0 ssh_run exited ${result.code} on ${host}`,
+        result.code === 0 ? "info" : "warning"
+      );
       return {
         content: [{ type: "text", text: `Exit code: ${result.code}
 
@@ -8452,6 +8545,7 @@ ${truncatedText}${suffix}` }],
   });
 }
 export {
+  SPINNER_INTERVAL_MS,
   index_default as default,
   validatorFor
 };
