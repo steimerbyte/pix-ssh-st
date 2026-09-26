@@ -3,3 +3,4 @@ bun.lockb
 bun.lock
 *.log
 .DS_Store
+*.bak-*

@@ -79,6 +79,7 @@ import {
 	SESSION_APPROVAL_TTL_MS,
 	SUDO_APPROVAL_TTL_MS,
 	loadSshConfig,
+	setIdentityFileOverride,
 } from "./lib.ts";
 
 const PROMPT_TIMEOUT_MS = 60_000;
@@ -111,6 +112,7 @@ const credCache = new Map<string, HostCreds>();
 //   confirm: true  (default) → fork's TTL-Map Verhalten: ein Allow pro Host
 //                    pro Session (non-priv) bzw. 30-min Rolling (sudo).
 const sshRunConfig = loadSshConfig();
+setIdentityFileOverride(sshRunConfig.defaultIdentityFile);
 const approvedHosts = new Map<string, number>();
 const approvedSudoHosts = new Map<string, number>();
 
@@ -625,11 +627,19 @@ export default function (pi: ExtensionAPI): void {
 			const privileged = action === "command" && (sudo || commandEscalatesPrivilege(command));
 			const sessionAlive = hostApproved(approvedHosts, key, Date.now(), SESSION_APPROVAL_TTL_MS);
 			const sudoAlive = hostApproved(approvedSudoHosts, key, Date.now(), SUDO_APPROVAL_TTL_MS);
+			// sudoConfirm: false → masked sudo-password overlay skipped when no
+			// other prompt is outstanding. Pair this with NOPASSWD sudo on the
+			// remote (or `sudoNoPassword` will detect it) so promptFor stays
+			// empty and the call goes through without user input.
+			const sudoOnlyNoPrompt =
+				promptFor.length === 1 &&
+				promptFor[0] === "sudo" &&
+				sshRunConfig.sudoConfirm === false;
 			// sshRunConfig.confirm: false → immer erlauben (kein Overlay, Maps
 			// ungenutzt). true (default) → TTL-Map Verhalten des Forks.
 			const alreadyApproved =
 				action === "command" &&
-				promptFor.length === 0 &&
+				(promptFor.length === 0 || sudoOnlyNoPrompt) &&
 				(!sshRunConfig.confirm || (privileged ? sudoAlive : sessionAlive));
 			if (alreadyApproved) {
 				const kind = privileged ? "sudo (30-min)" : "session";
@@ -643,7 +653,10 @@ export default function (pi: ExtensionAPI): void {
 
 			const runOverlay = (): Promise<OverlayResult> =>
 				withAgentBlock(pi.events, "ssh_run", "SSH approval required", async () => {
-					if ((transferDecision === "allow" || yolo || alreadyApproved) && promptFor.length === 0) {
+					if (
+						(transferDecision === "allow" || yolo || alreadyApproved) &&
+						(promptFor.length === 0 || sudoOnlyNoPrompt)
+					) {
 						return { action: "approved", password: "" } as OverlayResult;
 					}
 					// Confirm-only when no password is missing.

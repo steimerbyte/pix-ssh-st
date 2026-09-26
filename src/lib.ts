@@ -113,6 +113,29 @@ export interface SshRunConfig {
 	 * for sudo.
 	 */
 	confirm: boolean;
+	/**
+	 * When set, overrides the IdentityFile used by `ssh`/`sshpass` invocations
+	 * with this local path AND forces `IdentitiesOnly=yes`. Lets a user point
+	 * the plugin at a key that lives elsewhere than what `~/.ssh/config`
+	 * specifies (e.g. a Windows-hosted key when running on agent-pc).
+	 * Falls back to the SSH-config IdentityFile if omitted.
+	 */
+	defaultIdentityFile?: string;
+	/**
+	 * When `false`, the masked password overlay for a missing sudo password
+	 * is skipped — ssh_run sends the command with an empty sudo password.
+	 * This is meant for hosts where `bsteimer` (or equivalent) has been given
+	 * `NOPASSWD` sudo via /etc/sudoers.d/ (the probe for `sudoNoPassword` then
+	 * succeeds before the overlay stage and promptFor stays empty). On hosts
+	 * without NOPASSWD sudo, the remote sudo call will fail with a password
+	 * prompt visible in the run output. Lets a local user lock the fork into
+	 * "sudo: niemals nachfragen" mode for machines where the sudo policy is
+	 * already strict on the remote side.
+	 *
+	 * When `true` (default), the fork's behavior applies: the masked sudo
+	 * password overlay shows whenever a sudo password is missing.
+	 */
+	sudoConfirm?: boolean;
 }
 
 /** What the plugin uses when no config file is present. */
@@ -153,7 +176,23 @@ export function loadSshConfig(path: string = DEFAULT_SSH_RUN_CONFIG_PATH): SshRu
 		process.stderr.write(`ssh_run: ignoring ${path} — "confirm" must be boolean\n`);
 		return DEFAULT_SSH_RUN_CONFIG;
 	}
-	return { confirm: obj.confirm };
+	let defaultIdentityFile: string | undefined;
+	if ("defaultIdentityFile" in obj) {
+		if (typeof obj.defaultIdentityFile !== "string" || obj.defaultIdentityFile.length === 0) {
+			process.stderr.write(`ssh_run: ignoring ${path} — "defaultIdentityFile" must be non-empty string\n`);
+		} else {
+			defaultIdentityFile = obj.defaultIdentityFile;
+		}
+	}
+	let sudoConfirm: boolean | undefined;
+	if ("sudoConfirm" in obj) {
+		if (typeof obj.sudoConfirm !== "boolean") {
+			process.stderr.write(`ssh_run: ignoring ${path} — "sudoConfirm" must be boolean\n`);
+		} else {
+			sudoConfirm = obj.sudoConfirm;
+		}
+	}
+	return { confirm: obj.confirm, defaultIdentityFile, sudoConfirm };
 }
 
 /** ControlPersist window (seconds) — the multiplexed connection lingers this
@@ -412,6 +451,17 @@ export function controlPathFor(spec: HostSpec): string {
 
 // ── ssh argv construction ────────────────────────────────────────────────────
 
+/** Module-level override for the SSH identity file. Set by src/index.ts once
+ * at plugin load (from ssh.json). When set, every ssh/sshpass invocation
+ * uses this key with `IdentitiesOnly=yes`, bypassing whatever the user's
+ * `~/.ssh/config` says (which can point at a Windows path that doesn't
+ * exist on the agent-pc runtime). */
+let identityFileOverride: string | undefined;
+
+export function setIdentityFileOverride(path: string | undefined): void {
+	identityFileOverride = path;
+}
+
 /** Base ssh options shared by every invocation: multiplexing + timeouts +
  * non-interactive prompts (BatchMode is toggled by the caller). */
 function connectionArgs(spec: HostSpec, controlPath: string, portFlag: "-p" | "-P"): string[] {
@@ -427,6 +477,9 @@ function connectionArgs(spec: HostSpec, controlPath: string, portFlag: "-p" | "-
 		"-o",
 		"StrictHostKeyChecking=accept-new",
 	];
+	if (identityFileOverride) {
+		args.push("-i", identityFileOverride, "-o", "IdentitiesOnly=yes");
+	}
 	if (spec.port !== undefined) args.push(portFlag, String(spec.port));
 	return args;
 }

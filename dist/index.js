@@ -7425,7 +7425,25 @@ function loadSshConfig(path = DEFAULT_SSH_RUN_CONFIG_PATH) {
 `);
     return DEFAULT_SSH_RUN_CONFIG;
   }
-  return { confirm: obj.confirm };
+  let defaultIdentityFile;
+  if ("defaultIdentityFile" in obj) {
+    if (typeof obj.defaultIdentityFile !== "string" || obj.defaultIdentityFile.length === 0) {
+      process.stderr.write(`ssh_run: ignoring ${path} \u2014 "defaultIdentityFile" must be non-empty string
+`);
+    } else {
+      defaultIdentityFile = obj.defaultIdentityFile;
+    }
+  }
+  let sudoConfirm;
+  if ("sudoConfirm" in obj) {
+    if (typeof obj.sudoConfirm !== "boolean") {
+      process.stderr.write(`ssh_run: ignoring ${path} \u2014 "sudoConfirm" must be boolean
+`);
+    } else {
+      sudoConfirm = obj.sudoConfirm;
+    }
+  }
+  return { confirm: obj.confirm, defaultIdentityFile, sudoConfirm };
 }
 var CONTROL_PERSIST_SECONDS = 120;
 var CONNECT_TIMEOUT_SECONDS = 10;
@@ -7590,6 +7608,10 @@ function controlPathFor(spec) {
   const hash = createHash("sha256").update(key).digest("hex").slice(0, 16);
   return join5(tmpdir(), `pix-ssh-${hash}.sock`);
 }
+var identityFileOverride;
+function setIdentityFileOverride(path) {
+  identityFileOverride = path;
+}
 function connectionArgs(spec, controlPath, portFlag) {
   const args = [
     "-o",
@@ -7603,6 +7625,9 @@ function connectionArgs(spec, controlPath, portFlag) {
     "-o",
     "StrictHostKeyChecking=accept-new"
   ];
+  if (identityFileOverride) {
+    args.push("-i", identityFileOverride, "-o", "IdentitiesOnly=yes");
+  }
   if (spec.port !== void 0) args.push(portFlag, String(spec.port));
   return args;
 }
@@ -7779,6 +7804,7 @@ var MAX_PASSWORD_ATTEMPTS = 3;
 var SPINNER_INTERVAL_MS = 120;
 var credCache = /* @__PURE__ */ new Map();
 var sshRunConfig = loadSshConfig();
+setIdentityFileOverride(sshRunConfig.defaultIdentityFile);
 var approvedHosts = /* @__PURE__ */ new Map();
 var approvedSudoHosts = /* @__PURE__ */ new Map();
 function cacheKey(spec) {
@@ -8107,7 +8133,8 @@ function index_default(pi) {
       const privileged = action === "command" && (sudo || commandEscalatesPrivilege(command));
       const sessionAlive = hostApproved(approvedHosts, key, Date.now(), SESSION_APPROVAL_TTL_MS);
       const sudoAlive = hostApproved(approvedSudoHosts, key, Date.now(), SUDO_APPROVAL_TTL_MS);
-      const alreadyApproved = action === "command" && promptFor.length === 0 && (!sshRunConfig.confirm || (privileged ? sudoAlive : sessionAlive));
+      const sudoOnlyNoPrompt = promptFor.length === 1 && promptFor[0] === "sudo" && sshRunConfig.sudoConfirm === false;
+      const alreadyApproved = action === "command" && (promptFor.length === 0 || sudoOnlyNoPrompt) && (!sshRunConfig.confirm || (privileged ? sudoAlive : sessionAlive));
       if (alreadyApproved) {
         const kind = privileged ? "sudo (30-min)" : "session";
         ctx.ui.notify(`ssh_run: reused ${kind} approval for ${host}`, "info");
@@ -8118,7 +8145,7 @@ function index_default(pi) {
         );
       }
       const runOverlay = () => withAgentBlock(pi.events, "ssh_run", "SSH approval required", async () => {
-        if ((transferDecision === "allow" || yolo || alreadyApproved) && promptFor.length === 0) {
+        if ((transferDecision === "allow" || yolo || alreadyApproved) && (promptFor.length === 0 || sudoOnlyNoPrompt)) {
           return { action: "approved", password: "" };
         }
         if (promptFor.length === 0) {

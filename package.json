@@ -3,19 +3,22 @@
 	"version": "0.1.0",
 	"description": "Pi tool — ssh_run with fork policy: approve once per session (non-privileged) + 30-min rolling window for sudo commands.",
 	"type": "module",
-	"main": "src/index.ts",
+	"main": "dist/index.js",
 	"scripts": {
-		"test": "bun test"
+		"test": "bun test",
+		"build": "esbuild src/index.ts --bundle --platform=node --target=node22 --format=esm --external:@earendil-works/* --external:node:* --outfile=dist/index.js",
+		"watch": "esbuild src/index.ts --bundle --platform=node --target=node22 --format=esm --external:@earendil-works/* --external:node:* --outfile=dist/index.js --watch"
 	},
 	"files": [
 		"src",
+		"dist",
 		"!src/**/*.test.*",
 		"README.md",
 		"LICENSE"
 	],
 	"pi": {
 		"extensions": [
-			"src/index.ts"
+			"dist/index.js"
 		]
 	},
 	"keywords": [
@@ -40,12 +43,15 @@
 		"access": "public"
 	},
 	"dependencies": {
-		"typebox": "^1.1.38",
 		"@xynogen/pix-pretty": "^1.25.0",
-		"@xynogen/pix-runtime": "^0.8.0"
+		"@xynogen/pix-runtime": "^0.8.0",
+		"typebox": "^1.1.38"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*",
 		"@earendil-works/pi-tui": "*"
+	},
+	"devDependencies": {
+		"esbuild": "^0.28.2"
 	}
 }
