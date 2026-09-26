@@ -327,21 +327,22 @@ export function parseSshConfig(output: string): HostSpec | undefined {
 }
 
 /** Resolve aliases through OpenSSH config, including Include and Match rules. */
-export function resolveSshHost(spec: HostSpec, signal?: AbortSignal): Promise<HostSpec> {
+export async function resolveSshHost(spec: HostSpec, signal?: AbortSignal): Promise<HostSpec> {
 	const args = ["-G"];
 	if (spec.port !== undefined) args.push("-p", String(spec.port));
 	args.push(hostTarget(spec));
-
-	return new Promise((resolve) => {
-		let stdout = "";
-		const proc = spawn(SSH_BIN, args, { stdio: ["ignore", "pipe", "ignore"] });
-		proc.stdout.on("data", (chunk: Buffer) => {
-			stdout += chunk.toString();
+	try {
+		const { stdout, code } = await runSshChild({
+			bin: SSH_BIN,
+			args,
+			capture: { stdout: true, stderr: false },
+			signal,
 		});
-		proc.on("error", () => resolve(spec));
-		proc.on("close", (code) => resolve(code === 0 ? (parseSshConfig(stdout) ?? spec) : spec));
-		signal?.addEventListener("abort", () => proc.kill("SIGTERM"), { once: true });
-	});
+		return code === 0 ? (parseSshConfig(stdout) ?? spec) : spec;
+	} catch {
+		// Spawn failure (ENOENT) or abort — fall back to the original spec.
+		return spec;
+	}
 }
 
 // ── Host inventory (info action) ─────────────────────────────────────────────
@@ -464,20 +465,21 @@ export function parseHostInfo(output: string): HostInfo {
 }
 
 /** Run `ssh -G <host>` and return its effective config. Never connects. */
-export function resolveHostInfo(spec: HostSpec, signal?: AbortSignal): Promise<HostInfo> {
+export async function resolveHostInfo(spec: HostSpec, signal?: AbortSignal): Promise<HostInfo> {
 	const args = ["-G"];
 	if (spec.port !== undefined) args.push("-p", String(spec.port));
 	args.push(hostTarget(spec));
-	return new Promise((resolve) => {
-		let stdout = "";
-		const proc = spawn(SSH_BIN, args, { stdio: ["ignore", "pipe", "ignore"] });
-		proc.stdout.on("data", (c: Buffer) => {
-			stdout += c.toString();
+	try {
+		const { stdout, code } = await runSshChild({
+			bin: SSH_BIN,
+			args,
+			capture: { stdout: true, stderr: false },
+			signal,
 		});
-		proc.on("error", () => resolve({}));
-		proc.on("close", (code) => resolve(code === 0 ? parseHostInfo(stdout) : {}));
-		signal?.addEventListener("abort", () => proc.kill("SIGTERM"), { once: true });
-	});
+		return code === 0 ? parseHostInfo(stdout) : {};
+	} catch {
+		return {};
+	}
 }
 
 /** Canonical `[user@]host` target string for ssh argv. */
@@ -676,26 +678,25 @@ export type ProbeResult = "ok" | "auth" | "unreachable";
  * connection/DNS failure (unreachable) — the last must NOT trigger a password
  * prompt, since a login password can't fix an unreachable host.
  */
-export function probeKeyAuth(
+export async function probeKeyAuth(
 	spec: HostSpec,
 	controlPath: string,
 	signal?: AbortSignal,
 ): Promise<ProbeResult> {
 	const args = [...baseSshArgs(spec, controlPath), "-o", "BatchMode=yes", hostTarget(spec), "true"];
-	return new Promise((resolve) => {
-		let stderr = "";
-		const proc = spawn(SSH_BIN, args, { stdio: ["ignore", "ignore", "pipe"] });
-		proc.stderr.on("data", (c: Buffer) => {
-			stderr += c.toString();
+	try {
+		const { stderr, code } = await runSshChild({
+			bin: SSH_BIN,
+			args,
+			capture: { stdout: false, stderr: true },
+			signal,
 		});
-		proc.on("error", () => resolve("unreachable"));
-		proc.on("close", (code) => {
-			if (code === 0) return resolve("ok");
-			if (isUnreachable(stderr)) return resolve("unreachable");
-			resolve("auth");
-		});
-		signal?.addEventListener("abort", () => proc.kill("SIGTERM"), { once: true });
-	});
+		if (code === 0) return "ok";
+		if (isUnreachable(stderr)) return "unreachable";
+		return "auth";
+	} catch {
+		return "unreachable";
+	}
 }
 
 /**
@@ -709,7 +710,7 @@ export function probeKeyAuth(
  * toward a per-connection lockout; a host with fail2ban-style IP banning is the
  * ceiling — then drop back to a single prompt.
  */
-export function probePasswordAuth(
+export async function probePasswordAuth(
 	spec: HostSpec,
 	controlPath: string,
 	password: string,
@@ -717,7 +718,7 @@ export function probePasswordAuth(
 ): Promise<boolean> {
 	const args = [
 		"-e",
-		"ssh",
+		SSH_BIN,
 		...baseSshArgs(spec, controlPath),
 		"-o",
 		"BatchMode=no",
@@ -730,23 +731,22 @@ export function probePasswordAuth(
 		hostTarget(spec),
 		"true",
 	];
-	return new Promise((resolve) => {
-		let stderr = "";
-		const proc = spawn(SSHPASS_BIN, args, {
-			stdio: ["ignore", "ignore", "pipe"],
+	try {
+		const { stderr, code } = await runSshChild({
+			bin: SSHPASS_BIN,
+			args,
 			env: { ...process.env, [SSHPASS_ENV]: password },
+			capture: { stdout: false, stderr: true },
+			signal,
 		});
-		proc.stderr.on("data", (c: Buffer) => {
-			stderr += c.toString();
-		});
-		proc.on("error", () => resolve(true));
-		proc.on("close", (code) => {
-			if (code === 0) return resolve(true);
-			if (isUnreachable(stderr)) return resolve(true);
-			resolve(false);
-		});
-		signal?.addEventListener("abort", () => proc.kill("SIGTERM"), { once: true });
-	});
+		if (code === 0) return true;
+		if (isUnreachable(stderr)) return true;
+		return false;
+	} catch {
+		// Spawn failure (sshpass missing) — defer to the real run instead
+		// of burning a retry attempt.
+		return true;
+	}
 }
 
 /**
@@ -761,7 +761,7 @@ export function probePasswordAuth(
  * own channel with `BatchMode=yes`, so callers must only probe when
  * SSH login auth already succeeds without prompting.
  */
-export function probeSudoNoPassword(
+export async function probeSudoNoPassword(
 	spec: HostSpec,
 	controlPath: string,
 	command: string,
@@ -774,12 +774,17 @@ export function probeSudoNoPassword(
 		hostTarget(spec),
 		`sudo -n -- sh -c ${shellQuote(command)}`,
 	];
-	return new Promise((resolve) => {
-		const proc = spawn(SSH_BIN, args, { stdio: ["ignore", "ignore", "ignore"] });
-		proc.on("error", () => resolve(false));
-		proc.on("close", (code) => resolve(code === 0));
-		signal?.addEventListener("abort", () => proc.kill("SIGTERM"), { once: true });
-	});
+	try {
+		const { code } = await runSshChild({
+			bin: SSH_BIN,
+			args,
+			capture: { stdout: false, stderr: false },
+			signal,
+		});
+		return code === 0;
+	} catch {
+		return false;
+	}
 }
 
 /** Connection/DNS-level failure (not an auth rejection) — a password can't fix it. */
@@ -869,6 +874,99 @@ export function runSsh(spec: HostSpec, command: string, opts: RunOptions): Promi
 	return spawnResult(bin, args, env, opts.signal, opts.sudo ? filterSudoPrompt : undefined, stdin, opts.onChunk);
 }
 
+interface RunSshChildOpts {
+	bin: string;
+	args: string[];
+	env?: NodeJS.ProcessEnv;
+	/** Which streams to pipe. Defaults: stdout + stderr piped, stdin ignored. */
+	capture?: { stdout?: boolean; stderr?: boolean };
+	/** Filter stderr chunks before accumulating (e.g. strip sudo prompt). */
+	filterStderr?: (value: string) => string;
+	/** Data to write to the child's stdin then close. */
+	stdin?: string;
+	/** Per-chunk callback for live streaming. Swallows caller-side errors. */
+	onChunk?: (stdout: string, stderr: string) => void;
+	/** AbortSignal: SIGTERM first, escalate to SIGKILL after 5s. */
+	signal?: AbortSignal;
+}
+
+/**
+	 * Single spawn helper that every SSH/scp/sshpass invocation in this
+	 * module goes through. Centralises:
+	 *   - stdio wiring (defaults capture both stdout+stderr; opt out per
+	 *     stream via opts.capture)
+	 *   - chunk accumulation with optional filterStderr (sudo prompt strip)
+	 *   - per-chunk onChunk callback for live streaming (errors swallowed)
+	 *   - AbortSignal handling with SIGTERM → SIGKILL escalation after 5s
+	 *   - listener cleanup so long-lived signals don't accumulate handlers
+	 *
+	 * Rejects on:
+	 *   - spawn failure (ENOENT, EACCES, …) → original Node error
+	 *   - abort signal → Error("aborted by signal")
+	 * Callers that want fallback on spawn error should .catch() and return
+	 * their default (e.g. resolveSshHost returns the original spec).
+	 */
+function runSshChild(opts: RunSshChildOpts): Promise<SshResult> {
+	const capture = opts.capture ?? {};
+	const captureStdout = capture.stdout ?? true;
+	const captureStderr = capture.stderr ?? true;
+	const stdio: ["ignore" | "pipe", "ignore" | "pipe", "ignore" | "pipe"] = [
+		opts.stdin !== undefined ? "pipe" : "ignore",
+		captureStdout ? "pipe" : "ignore",
+		captureStderr ? "pipe" : "ignore",
+	];
+	return new Promise((resolve, reject) => {
+		const proc = spawn(opts.bin, opts.args, {
+			stdio,
+			env: opts.env ?? process.env,
+		});
+		let stdout = "";
+		let stderr = "";
+		const fireChunk = () => {
+			if (!opts.onChunk) return;
+			try {
+				opts.onChunk(stdout, stderr);
+			} catch {
+				// Caller-side error — swallow so it doesn't break the run.
+			}
+		};
+		proc.stdout?.on("data", (c: Buffer) => {
+			stdout += c.toString();
+			fireChunk();
+		});
+		proc.stderr?.on("data", (c: Buffer) => {
+			const value = opts.filterStderr ? opts.filterStderr(c.toString()) : c.toString();
+			if (value) stderr += value;
+			fireChunk();
+		});
+		proc.on("error", reject);
+		proc.on("close", (code) => resolve({ stdout, stderr, code: code ?? 1 }));
+		if (opts.stdin && proc.stdin) {
+			proc.stdin.write(opts.stdin);
+			proc.stdin.end();
+		} else if (proc.stdin) {
+			proc.stdin.end();
+		}
+		if (opts.signal) {
+			let killed = false;
+			const onAbort = () => {
+				if (killed) return;
+				killed = true;
+				proc.kill("SIGTERM");
+				setTimeout(() => {
+					if (!proc.killed) proc.kill("SIGKILL");
+				}, 5000);
+				reject(new Error("aborted by signal"));
+			};
+			opts.signal.addEventListener("abort", onAbort, { once: true });
+			// Drop the listener once the child exits naturally so long-lived
+			// signals don't accumulate handlers across many spawn calls.
+			proc.once("close", () => opts.signal!.removeEventListener("abort", onAbort));
+		}
+	});
+}
+
+/** Thin wrapper kept for back-compat — runSsh/runTransfer still call it. */
 function spawnResult(
 	bin: string,
 	args: string[],
@@ -878,60 +976,13 @@ function spawnResult(
 	stdin?: string,
 	onChunk?: (stdout: string, stderr: string) => void,
 ): Promise<SshResult> {
-	return new Promise((resolve, reject) => {
-		const proc = spawn(bin, args, { stdio: ["pipe", "pipe", "pipe"], env });
-		let stdout = "";
-		let stderr = "";
-		// Helper: invoke onChunk without throwing into the data handler. If the
-		// caller's handler throws, we'd otherwise lose the chunk and possibly
-		// reject the whole run.
-		const fire = () => {
-			if (!onChunk) return;
-			try {
-				onChunk(stdout, stderr);
-			} catch {
-				// Caller-side error — swallow so we don't break the run.
-			}
-		};
-		proc.stdout.on("data", (c: Buffer) => {
-			stdout += c.toString();
-			fire();
-		});
-		proc.stderr.on("data", (c: Buffer) => {
-			const value = filterStderr ? filterStderr(c.toString()) : c.toString();
-			if (value) stderr += value;
-			fire();
-		});
-		proc.on("error", reject);
-		proc.on("close", (code) => resolve({ stdout, stderr, code: code ?? 1 }));
-		if (stdin) proc.stdin.write(stdin);
-		proc.stdin.end();
-		signal(sig, proc, reject);
+	return runSshChild({
+		bin,
+		args,
+		env,
+		filterStderr,
+		stdin,
+		onChunk,
+		signal: sig,
 	});
-}
-
-function signal(
-	sig: AbortSignal | undefined,
-	proc: ReturnType<typeof spawn>,
-	reject: (e: Error) => void,
-): void {
-	if (!sig) return;
-	let killed = false;
-	const handler = () => {
-		if (killed) return;
-		killed = true;
-		// Try graceful first; if the child ignores SIGTERM (stuck in a 3rd-party
-		// binary, ControlMaster socket, etc.) escalate to SIGKILL after 5s.
-		proc.kill("SIGTERM");
-		setTimeout(() => {
-			if (!proc.killed) proc.kill("SIGKILL");
-		}, 5000);
-		// Distinct error so the caller can render "cancelled by abort" instead
-		// of generic "Cancelled".
-		reject(new Error("aborted by signal"));
-	};
-	sig.addEventListener("abort", handler, { once: true });
-	// Drop the listener once the child exits naturally so long-lived signals
-	// don't accumulate listeners across many spawn calls.
-	proc.once("close", () => sig.removeEventListener("abort", handler));
 }

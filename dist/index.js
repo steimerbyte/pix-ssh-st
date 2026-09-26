@@ -7514,20 +7514,21 @@ function parseSshConfig(output) {
   if (!user || !host || !port) return void 0;
   return { user, host, port: parsePort(port) };
 }
-function resolveSshHost(spec, signal2) {
+async function resolveSshHost(spec, signal) {
   const args = ["-G"];
   if (spec.port !== void 0) args.push("-p", String(spec.port));
   args.push(hostTarget(spec));
-  return new Promise((resolve) => {
-    let stdout = "";
-    const proc = spawn2(SSH_BIN, args, { stdio: ["ignore", "pipe", "ignore"] });
-    proc.stdout.on("data", (chunk) => {
-      stdout += chunk.toString();
+  try {
+    const { stdout, code } = await runSshChild({
+      bin: SSH_BIN,
+      args,
+      capture: { stdout: true, stderr: false },
+      signal
     });
-    proc.on("error", () => resolve(spec));
-    proc.on("close", (code) => resolve(code === 0 ? parseSshConfig(stdout) ?? spec : spec));
-    signal2?.addEventListener("abort", () => proc.kill("SIGTERM"), { once: true });
-  });
+    return code === 0 ? parseSshConfig(stdout) ?? spec : spec;
+  } catch {
+    return spec;
+  }
 }
 var INFO_KEYS = {
   hostname: "hostname",
@@ -7605,20 +7606,21 @@ function parseHostInfo(output) {
   }
   return info;
 }
-function resolveHostInfo(spec, signal2) {
+async function resolveHostInfo(spec, signal) {
   const args = ["-G"];
   if (spec.port !== void 0) args.push("-p", String(spec.port));
   args.push(hostTarget(spec));
-  return new Promise((resolve) => {
-    let stdout = "";
-    const proc = spawn2(SSH_BIN, args, { stdio: ["ignore", "pipe", "ignore"] });
-    proc.stdout.on("data", (c) => {
-      stdout += c.toString();
+  try {
+    const { stdout, code } = await runSshChild({
+      bin: SSH_BIN,
+      args,
+      capture: { stdout: true, stderr: false },
+      signal
     });
-    proc.on("error", () => resolve({}));
-    proc.on("close", (code) => resolve(code === 0 ? parseHostInfo(stdout) : {}));
-    signal2?.addEventListener("abort", () => proc.kill("SIGTERM"), { once: true });
-  });
+    return code === 0 ? parseHostInfo(stdout) : {};
+  } catch {
+    return {};
+  }
 }
 function hostTarget(spec) {
   return spec.user ? `${spec.user}@${spec.host}` : spec.host;
@@ -7711,27 +7713,26 @@ function truncate(text, maxLines = MAX_OUTPUT_LINES, maxBytes = MAX_OUTPUT_BYTES
   }
   return { text: result, truncated: true };
 }
-function probeKeyAuth(spec, controlPath, signal2) {
+async function probeKeyAuth(spec, controlPath, signal) {
   const args = [...baseSshArgs(spec, controlPath), "-o", "BatchMode=yes", hostTarget(spec), "true"];
-  return new Promise((resolve) => {
-    let stderr = "";
-    const proc = spawn2(SSH_BIN, args, { stdio: ["ignore", "ignore", "pipe"] });
-    proc.stderr.on("data", (c) => {
-      stderr += c.toString();
+  try {
+    const { stderr, code } = await runSshChild({
+      bin: SSH_BIN,
+      args,
+      capture: { stdout: false, stderr: true },
+      signal
     });
-    proc.on("error", () => resolve("unreachable"));
-    proc.on("close", (code) => {
-      if (code === 0) return resolve("ok");
-      if (isUnreachable(stderr)) return resolve("unreachable");
-      resolve("auth");
-    });
-    signal2?.addEventListener("abort", () => proc.kill("SIGTERM"), { once: true });
-  });
+    if (code === 0) return "ok";
+    if (isUnreachable(stderr)) return "unreachable";
+    return "auth";
+  } catch {
+    return "unreachable";
+  }
 }
-function probePasswordAuth(spec, controlPath, password, signal2) {
+async function probePasswordAuth(spec, controlPath, password, signal) {
   const args = [
     "-e",
-    "ssh",
+    SSH_BIN,
     ...baseSshArgs(spec, controlPath),
     "-o",
     "BatchMode=no",
@@ -7744,25 +7745,22 @@ function probePasswordAuth(spec, controlPath, password, signal2) {
     hostTarget(spec),
     "true"
   ];
-  return new Promise((resolve) => {
-    let stderr = "";
-    const proc = spawn2(SSHPASS_BIN, args, {
-      stdio: ["ignore", "ignore", "pipe"],
-      env: { ...process.env, [SSHPASS_ENV]: password }
+  try {
+    const { stderr, code } = await runSshChild({
+      bin: SSHPASS_BIN,
+      args,
+      env: { ...process.env, [SSHPASS_ENV]: password },
+      capture: { stdout: false, stderr: true },
+      signal
     });
-    proc.stderr.on("data", (c) => {
-      stderr += c.toString();
-    });
-    proc.on("error", () => resolve(true));
-    proc.on("close", (code) => {
-      if (code === 0) return resolve(true);
-      if (isUnreachable(stderr)) return resolve(true);
-      resolve(false);
-    });
-    signal2?.addEventListener("abort", () => proc.kill("SIGTERM"), { once: true });
-  });
+    if (code === 0) return true;
+    if (isUnreachable(stderr)) return true;
+    return false;
+  } catch {
+    return true;
+  }
 }
-function probeSudoNoPassword(spec, controlPath, command, signal2) {
+async function probeSudoNoPassword(spec, controlPath, command, signal) {
   const args = [
     ...baseSshArgs(spec, controlPath),
     "-o",
@@ -7770,12 +7768,17 @@ function probeSudoNoPassword(spec, controlPath, command, signal2) {
     hostTarget(spec),
     `sudo -n -- sh -c ${shellQuote(command)}`
   ];
-  return new Promise((resolve) => {
-    const proc = spawn2(SSH_BIN, args, { stdio: ["ignore", "ignore", "ignore"] });
-    proc.on("error", () => resolve(false));
-    proc.on("close", (code) => resolve(code === 0));
-    signal2?.addEventListener("abort", () => proc.kill("SIGTERM"), { once: true });
-  });
+  try {
+    const { code } = await runSshChild({
+      bin: SSH_BIN,
+      args,
+      capture: { stdout: false, stderr: false },
+      signal
+    });
+    return code === 0;
+  } catch {
+    return false;
+  }
 }
 function isUnreachable(stderr) {
   const lower = stderr.toLowerCase();
@@ -7803,48 +7806,72 @@ function runSsh(spec, command, opts) {
 ` : void 0;
   return spawnResult(bin, args, env, opts.signal, opts.sudo ? filterSudoPrompt : void 0, stdin, opts.onChunk);
 }
-function spawnResult(bin, args, env, sig, filterStderr, stdin, onChunk) {
+function runSshChild(opts) {
+  const capture = opts.capture ?? {};
+  const captureStdout = capture.stdout ?? true;
+  const captureStderr = capture.stderr ?? true;
+  const stdio = [
+    opts.stdin !== void 0 ? "pipe" : "ignore",
+    captureStdout ? "pipe" : "ignore",
+    captureStderr ? "pipe" : "ignore"
+  ];
   return new Promise((resolve, reject) => {
-    const proc = spawn2(bin, args, { stdio: ["pipe", "pipe", "pipe"], env });
+    const proc = spawn2(opts.bin, opts.args, {
+      stdio,
+      env: opts.env ?? process.env
+    });
     let stdout = "";
     let stderr = "";
-    const fire = () => {
-      if (!onChunk) return;
+    const fireChunk = () => {
+      if (!opts.onChunk) return;
       try {
-        onChunk(stdout, stderr);
+        opts.onChunk(stdout, stderr);
       } catch {
       }
     };
-    proc.stdout.on("data", (c) => {
+    proc.stdout?.on("data", (c) => {
       stdout += c.toString();
-      fire();
+      fireChunk();
     });
-    proc.stderr.on("data", (c) => {
-      const value = filterStderr ? filterStderr(c.toString()) : c.toString();
+    proc.stderr?.on("data", (c) => {
+      const value = opts.filterStderr ? opts.filterStderr(c.toString()) : c.toString();
       if (value) stderr += value;
-      fire();
+      fireChunk();
     });
     proc.on("error", reject);
     proc.on("close", (code) => resolve({ stdout, stderr, code: code ?? 1 }));
-    if (stdin) proc.stdin.write(stdin);
-    proc.stdin.end();
-    signal(sig, proc, reject);
+    if (opts.stdin && proc.stdin) {
+      proc.stdin.write(opts.stdin);
+      proc.stdin.end();
+    } else if (proc.stdin) {
+      proc.stdin.end();
+    }
+    if (opts.signal) {
+      let killed = false;
+      const onAbort = () => {
+        if (killed) return;
+        killed = true;
+        proc.kill("SIGTERM");
+        setTimeout(() => {
+          if (!proc.killed) proc.kill("SIGKILL");
+        }, 5e3);
+        reject(new Error("aborted by signal"));
+      };
+      opts.signal.addEventListener("abort", onAbort, { once: true });
+      proc.once("close", () => opts.signal.removeEventListener("abort", onAbort));
+    }
   });
 }
-function signal(sig, proc, reject) {
-  if (!sig) return;
-  let killed = false;
-  const handler = () => {
-    if (killed) return;
-    killed = true;
-    proc.kill("SIGTERM");
-    setTimeout(() => {
-      if (!proc.killed) proc.kill("SIGKILL");
-    }, 5e3);
-    reject(new Error("aborted by signal"));
-  };
-  sig.addEventListener("abort", handler, { once: true });
-  proc.once("close", () => sig.removeEventListener("abort", handler));
+function spawnResult(bin, args, env, sig, filterStderr, stdin, onChunk) {
+  return runSshChild({
+    bin,
+    args,
+    env,
+    filterStderr,
+    stdin,
+    onChunk,
+    signal: sig
+  });
 }
 
 // src/index.ts
