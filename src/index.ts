@@ -642,8 +642,23 @@ export default function (pi: ExtensionAPI): void {
 				(promptFor.length === 0 || sudoOnlyNoPrompt) &&
 				(!sshRunConfig.confirm || (privileged ? sudoAlive : sessionAlive));
 			if (alreadyApproved) {
-				const kind = privileged ? "sudo (30-min)" : "session";
-				ctx.ui.notify(`ssh_run: reused ${kind} approval for ${host}`, "info");
+				// confirm:false means config-driven auto-allow, not TTL-reuse.
+				// Pick a kind label that tells the user which path was taken,
+				// so "reused sudo (30-min)" is never shown when the call was
+				// actually auto-allowed by ssh.json flags.
+				let kind: string;
+				if (!sshRunConfig.confirm) {
+					kind = sudoOnlyNoPrompt
+						? "config (confirm:false + sudoConfirm:false)"
+						: "config (confirm:false)";
+				} else if (sudoOnlyNoPrompt) {
+					kind = "config (sudoConfirm:false)";
+				} else if (privileged) {
+					kind = "sudo (30-min)";
+				} else {
+					kind = "session";
+				}
+				ctx.ui.notify(`ssh_run: auto allow turned on via ${kind} — ${host}`, "info");
 			} else if (transferDecision === "allow") {
 				ctx.ui.notify(
 					`⚠ ssh_run file transfer auto-approved — ${mode.toUpperCase()} warning policy`,

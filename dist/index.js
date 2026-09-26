@@ -8136,8 +8136,17 @@ function index_default(pi) {
       const sudoOnlyNoPrompt = promptFor.length === 1 && promptFor[0] === "sudo" && sshRunConfig.sudoConfirm === false;
       const alreadyApproved = action === "command" && (promptFor.length === 0 || sudoOnlyNoPrompt) && (!sshRunConfig.confirm || (privileged ? sudoAlive : sessionAlive));
       if (alreadyApproved) {
-        const kind = privileged ? "sudo (30-min)" : "session";
-        ctx.ui.notify(`ssh_run: reused ${kind} approval for ${host}`, "info");
+        let kind;
+        if (!sshRunConfig.confirm) {
+          kind = sudoOnlyNoPrompt ? "config (confirm:false + sudoConfirm:false)" : "config (confirm:false)";
+        } else if (sudoOnlyNoPrompt) {
+          kind = "config (sudoConfirm:false)";
+        } else if (privileged) {
+          kind = "sudo (30-min)";
+        } else {
+          kind = "session";
+        }
+        ctx.ui.notify(`ssh_run: auto allow turned on via ${kind} \u2014 ${host}`, "info");
       } else if (transferDecision === "allow") {
         ctx.ui.notify(
           `\u26A0 ssh_run file transfer auto-approved \u2014 ${mode.toUpperCase()} warning policy`,
