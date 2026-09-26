@@ -181,58 +181,84 @@ type SshParams = {
 	reason?: string;
 };
 
-interface SshOperation {
-	action: "command" | "file";
-	command: string;
-	sudo: boolean;
-	reason?: string;
-	direction?: TransferDirection;
-	source: string;
-	destination: string;
-	recursive: boolean;
-}
+/**
+	 * Discriminated union of every supported ssh_run operation. Each
+	 * variant carries only the fields it needs — `command` and `sudo`
+	 * are absent for file/info because they don't apply. Consumers
+	 * narrow on `kind` and TypeScript proves exhaustiveness via the
+	 * `never` guard in each switch's default branch.
+	 */
+export type Op =
+	| { kind: "command"; command: string; sudo: boolean; reason?: string }
+	| { kind: "file"; source: string; destination: string; direction: TransferDirection; recursive: boolean; reason?: string }
+	| { kind: "info"; host?: string };
 
-function normalizeOperation(params: SshParams): SshOperation {
-	if (params.action === "file") {
-		const source = (params.source ?? "").trim();
-		const destination = (params.destination ?? "").trim();
-		return {
-			action: "file",
-			command: `${params.direction ?? ""} ${source || "(empty source)"} → ${destination || "(empty destination)"}`,
-			sudo: false,
-			reason: params.reason,
-			direction: params.direction,
-			source,
-			destination,
-			recursive: params.recursive === true,
-		};
+function normalizeOperation(params: SshParams): Op {
+	const action = params.action ?? "command";
+	switch (action) {
+		case "command":
+			return {
+				kind: "command",
+				command: params.command ?? "",
+				sudo: params.sudo === true,
+					...(params.reason ? { reason: params.reason } : {}),
+			};
+		case "file": {
+			const source = (params.source ?? "").trim();
+			const destination = (params.destination ?? "").trim();
+			// Pre-flight guard for missing direction (BLOCKING UX/UI #1). The
+			// previous code silently defaulted to "upload" which is a
+			// data-loss risk. Fail loudly so the model fixes its call shape.
+			if (!params.direction) {
+				throw new Error('direction ("upload"|"download") is required when action is "file"');
+			}
+			return {
+				kind: "file",
+				source,
+				destination,
+				direction: params.direction,
+				recursive: params.recursive === true,
+					...(params.reason ? { reason: params.reason } : {}),
+			};
+		}
+		case "info":
+			return {
+				kind: "info",
+					...(params.host ? { host: params.host } : {}),
+			};
+		default: {
+			// Exhaustiveness guard — adding a new action variant to the SshParams
+			// union breaks here at compile time so this switch is kept in sync.
+			const _exhaustive: never = action;
+			throw new Error(`unknown action: ${String(_exhaustive)}`);
+		}
 	}
-	return {
-		action: "command",
-		command: params.command ?? "",
-		sudo: params.sudo === true,
-		reason: params.reason,
-		source: "",
-		destination: "",
-		recursive: false,
-	};
 }
 
-function approvalBody(operation: SshOperation, host: string, port?: number): string[] {
-	const { action, command, destination, direction, reason, recursive, source, sudo } = operation;
-	return [
-		reason?.trim() ? `Intent: ${reason.trim()}` : "No reason provided by AI",
+function approvalBody(op: Op, host: string, port?: number): string[] {
+	const base = [
+		op.reason?.trim() ? `Intent: ${op.reason.trim()}` : "No reason provided by AI",
 		`Host: ${host}${port ? ` (port ${port})` : ""}`,
-		...(action === "command"
-			? [`Command: ${sudo ? "sudo " : ""}${command}`]
-			: [
-					`Direction: ${direction === "download" ? "Download" : "Upload"}`,
-					`From: ${source}`,
-					`To: ${destination}`,
-					`Mode: ${recursive ? "Recursive copy" : "Single item"}`,
-					"Warning: existing destination may be overwritten",
-				]),
 	];
+	switch (op.kind) {
+		case "command":
+			return [...base, `Command: ${op.sudo ? "sudo " : ""}${op.command}`];
+		case "file":
+			return [
+				...base,
+					`Direction: ${op.direction === "download" ? "Download" : "Upload"}`,
+					`From: ${op.source}`,
+					`To: ${op.destination}`,
+					`Mode: ${op.recursive ? "Recursive copy" : "Single item"}`,
+					"Warning: existing destination may be overwritten",
+				];
+		case "info":
+			return [...base, "Action: info (read SSH config)"];
+		default: {
+			const _exhaustive: never = op;
+			throw new Error(`unknown op kind: ${String(_exhaustive)}`);
+		}
+	}
 }
 
 function safeOneLine(value: string): string {
@@ -523,9 +549,23 @@ export default function (pi: ExtensionAPI): void {
 					isError: true,
 				};
 			}
-			const operation = normalizeOperation(params);
-			const { action, command, destination, direction, reason, recursive, source, sudo } =
-				operation;
+			const op = normalizeOperation(params);
+			// Project Op discriminated union into local vars used by the rest of
+			// execute(). After normalizeOperation, op is command or file (info
+			// was handled by the early-return above). Using `kind` discrimination
+			// keeps the union's safety: each variant contributes only its own fields.
+			const isCommand = op.kind === "command";
+			const isFile = op.kind === "file";
+			const command = isCommand
+				? op.command
+				: `${op.direction ?? ""} ${op.source || "(empty source)"} → ${op.destination || "(empty destination)"}`;
+			const sudo = isCommand && op.sudo;
+			const source = isFile ? op.source : "";
+			const destination = isFile ? op.destination : "";
+			const direction = isFile ? op.direction : undefined;
+			const recursive = isFile && op.recursive;
+			const reason = op.reason;
+			const action: "command" | "file" = isCommand ? "command" : "file";
 
 			if (action === "file" && (!source || !destination)) {
 				return {
@@ -1085,12 +1125,37 @@ ctx.ui.notify(`🔐 Remote sudo authentication failed on ${host}`, "error");
 				);
 				return text;
 			}
-			const operation = normalizeOperation(args);
-			const command = safeOneLine(operation.command) || "(empty command)";
-			const prefix = operation.sudo ? "sudo " : "";
+			const op = normalizeOperation(args);
+			// Project the Op discriminated union into render-local vars. Each
+			// variant contributes only its own fields; kind-narrowing here gives
+			// us type-safe access without scattered action==='command' checks.
+			let label = "ssh";
+			let command = "";
+			let prefix = "";
+			switch (op.kind) {
+				case "command":
+					command = safeOneLine(op.command) || "(empty command)";
+					prefix = op.sudo ? "sudo " : "";
+					label = "ssh";
+				break;
+				case "file":
+					command = `${op.direction ?? ""} ${op.source || "(empty source)"} → ${op.destination || "(empty destination)"}`;
+					prefix = "";
+					label = "ssh file";
+				break;
+				case "info":
+					// info is short-circuited above by the args.action === "info" branch;
+					// guard for new variants so adding a kind doesn't silently misrender.
+					label = "ssh info";
+				break;
+				default: {
+					const _exhaustive: never = op;
+					throw new Error(`unknown op kind: ${String(_exhaustive)}`);
+				}
+			}
 			text.setText(
 				fillToolBackground(
-					`${theme.fg("toolTitle", theme.bold(operation.action === "file" ? "ssh file" : "ssh"))} ${theme.fg("dim", host)} ${theme.fg("muted", prefix + command)}`,
+					`${theme.fg("toolTitle", theme.bold(label))} ${theme.fg("dim", host)} ${theme.fg("muted", prefix + command)}`,
 				),
 			);
 			return text;

@@ -7891,43 +7891,65 @@ function validatorFor(stage, spec, controlPath, sig) {
   return (pw) => pw.trim().length === 0 ? Promise.resolve(false) : probePasswordAuth(spec, controlPath, pw, sig);
 }
 function normalizeOperation(params) {
-  if (params.action === "file") {
-    const source = (params.source ?? "").trim();
-    const destination = (params.destination ?? "").trim();
-    return {
-      action: "file",
-      command: `${params.direction ?? ""} ${source || "(empty source)"} \u2192 ${destination || "(empty destination)"}`,
-      sudo: false,
-      reason: params.reason,
-      direction: params.direction,
-      source,
-      destination,
-      recursive: params.recursive === true
-    };
+  const action = params.action ?? "command";
+  switch (action) {
+    case "command":
+      return {
+        kind: "command",
+        command: params.command ?? "",
+        sudo: params.sudo === true,
+        ...params.reason ? { reason: params.reason } : {}
+      };
+    case "file": {
+      const source = (params.source ?? "").trim();
+      const destination = (params.destination ?? "").trim();
+      if (!params.direction) {
+        throw new Error('direction ("upload"|"download") is required when action is "file"');
+      }
+      return {
+        kind: "file",
+        source,
+        destination,
+        direction: params.direction,
+        recursive: params.recursive === true,
+        ...params.reason ? { reason: params.reason } : {}
+      };
+    }
+    case "info":
+      return {
+        kind: "info",
+        ...params.host ? { host: params.host } : {}
+      };
+    default: {
+      const _exhaustive = action;
+      throw new Error(`unknown action: ${String(_exhaustive)}`);
+    }
   }
-  return {
-    action: "command",
-    command: params.command ?? "",
-    sudo: params.sudo === true,
-    reason: params.reason,
-    source: "",
-    destination: "",
-    recursive: false
-  };
 }
-function approvalBody(operation, host, port) {
-  const { action, command, destination, direction, reason, recursive, source, sudo } = operation;
-  return [
-    reason?.trim() ? `Intent: ${reason.trim()}` : "No reason provided by AI",
-    `Host: ${host}${port ? ` (port ${port})` : ""}`,
-    ...action === "command" ? [`Command: ${sudo ? "sudo " : ""}${command}`] : [
-      `Direction: ${direction === "download" ? "Download" : "Upload"}`,
-      `From: ${source}`,
-      `To: ${destination}`,
-      `Mode: ${recursive ? "Recursive copy" : "Single item"}`,
-      "Warning: existing destination may be overwritten"
-    ]
+function approvalBody(op, host, port) {
+  const base = [
+    op.reason?.trim() ? `Intent: ${op.reason.trim()}` : "No reason provided by AI",
+    `Host: ${host}${port ? ` (port ${port})` : ""}`
   ];
+  switch (op.kind) {
+    case "command":
+      return [...base, `Command: ${op.sudo ? "sudo " : ""}${op.command}`];
+    case "file":
+      return [
+        ...base,
+        `Direction: ${op.direction === "download" ? "Download" : "Upload"}`,
+        `From: ${op.source}`,
+        `To: ${op.destination}`,
+        `Mode: ${op.recursive ? "Recursive copy" : "Single item"}`,
+        "Warning: existing destination may be overwritten"
+      ];
+    case "info":
+      return [...base, "Action: info (read SSH config)"];
+    default: {
+      const _exhaustive = op;
+      throw new Error(`unknown op kind: ${String(_exhaustive)}`);
+    }
+  }
 }
 function safeOneLine(value) {
   return value.replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").replace(/\s+/g, " ").trim();
@@ -8146,8 +8168,17 @@ function index_default(pi) {
           isError: true
         };
       }
-      const operation = normalizeOperation(params);
-      const { action, command, destination, direction, reason, recursive, source, sudo } = operation;
+      const op = normalizeOperation(params);
+      const isCommand = op.kind === "command";
+      const isFile = op.kind === "file";
+      const command = isCommand ? op.command : `${op.direction ?? ""} ${op.source || "(empty source)"} \u2192 ${op.destination || "(empty destination)"}`;
+      const sudo = isCommand && op.sudo;
+      const source = isFile ? op.source : "";
+      const destination = isFile ? op.destination : "";
+      const direction = isFile ? op.direction : void 0;
+      const recursive = isFile && op.recursive;
+      const reason = op.reason;
+      const action = isCommand ? "command" : "file";
       if (action === "file" && (!source || !destination)) {
         return {
           content: [{ type: "text", text: "ssh_run failed: source and destination are required" }],
@@ -8562,12 +8593,32 @@ ${truncatedText}${suffix}` }],
         );
         return text;
       }
-      const operation = normalizeOperation(args);
-      const command = safeOneLine(operation.command) || "(empty command)";
-      const prefix = operation.sudo ? "sudo " : "";
+      const op = normalizeOperation(args);
+      let label = "ssh";
+      let command = "";
+      let prefix = "";
+      switch (op.kind) {
+        case "command":
+          command = safeOneLine(op.command) || "(empty command)";
+          prefix = op.sudo ? "sudo " : "";
+          label = "ssh";
+          break;
+        case "file":
+          command = `${op.direction ?? ""} ${op.source || "(empty source)"} \u2192 ${op.destination || "(empty destination)"}`;
+          prefix = "";
+          label = "ssh file";
+          break;
+        case "info":
+          label = "ssh info";
+          break;
+        default: {
+          const _exhaustive = op;
+          throw new Error(`unknown op kind: ${String(_exhaustive)}`);
+        }
+      }
       text.setText(
         fillToolBackground(
-          `${theme.fg("toolTitle", theme.bold(operation.action === "file" ? "ssh file" : "ssh"))} ${theme.fg("dim", host)} ${theme.fg("muted", prefix + command)}`
+          `${theme.fg("toolTitle", theme.bold(label))} ${theme.fg("dim", host)} ${theme.fg("muted", prefix + command)}`
         )
       );
       return text;
