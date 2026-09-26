@@ -8575,7 +8575,7 @@ ${truncatedText}${suffix}` }],
         isError: result.code !== 0
       };
     },
-    renderCall: ((args, theme, renderCtx) => {
+    renderCall: (args, theme, renderCtx) => {
       resolveBaseBackground(theme);
       const text = renderCtx.lastComponent ?? new Text("", 0, 0);
       if (hideCollapsedToolCall(
@@ -8622,12 +8622,12 @@ ${truncatedText}${suffix}` }],
         )
       );
       return text;
-    }),
-    renderResult: ((result, _opt, theme, renderCtx) => {
+    },
+    renderResult: (result, _opt, theme, renderCtx) => {
       resolveBaseBackground(theme);
       const text = unframeToolResult(renderCtx.lastComponent ?? new Text("", 0, 0));
       const details = result.details;
-      const isPartial = _opt?.isPartial === true;
+      const isPartial = _opt.isPartial === true;
       const completed = (isError) => frameToolResult(text, theme, isError);
       if (details?._type !== "sshResult") {
         if (renderCtx.isError) {
@@ -8689,7 +8689,7 @@ ${truncatedText}${suffix}` }],
       const out = isPartial ? [...body, ...footer] : ruleFrame(body, footer, termW(), paint);
       text.setText(fillToolBackground(out.join("\n")));
       return text;
-    })
+    }
   });
 }
 export {

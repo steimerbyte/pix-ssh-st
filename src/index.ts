@@ -32,7 +32,12 @@ import { MAX_PREVIEW_LINES } from "@xynogen/pix-pretty/config";
 import { type OverlayResult, showOverlay } from "@xynogen/pix-pretty/gate-overlay";
 import { icon } from "@xynogen/pix-pretty/icon-catalog";
 import { renderBashOutput } from "@xynogen/pix-pretty/renderers";
-import type { RenderContextLike, ThemeLike, ToolResultLike } from "@xynogen/pix-pretty/types";
+import type {
+	Theme,
+	ToolRenderContext,
+	ToolRenderResultOptions,
+	AgentToolResult,
+} from "@earendil-works/pi-coding-agent";
 import {
 	dotJoin,
 	fillToolBackground,
@@ -1106,7 +1111,7 @@ ctx.ui.notify(`🔐 Remote sudo authentication failed on ${host}`, "error");
 			};
 		},
 
-		renderCall: ((args: SshParams, theme: ThemeLike, renderCtx: RenderContextLike) => {
+		renderCall: (args: SshParams, theme: Theme, renderCtx: ToolRenderContext): unknown => {
 			resolveBaseBackground(theme);
 			const text = renderCtx.lastComponent ?? new Text("", 0, 0);
 			if (
@@ -1159,18 +1164,18 @@ ctx.ui.notify(`🔐 Remote sudo authentication failed on ${host}`, "error");
 				),
 			);
 			return text;
-		}) as never,
+		},
 
-		renderResult: ((
-			result: ToolResultLike,
-			_opt: unknown,
-			theme: ThemeLike,
-			renderCtx: RenderContextLike,
-		) => {
+		renderResult: (
+			result: AgentToolResult,
+			_opt: ToolRenderResultOptions,
+			theme: Theme,
+			renderCtx: ToolRenderContext,
+		): unknown => {
 			resolveBaseBackground(theme);
 			const text = unframeToolResult(renderCtx.lastComponent ?? new Text("", 0, 0));
 			const details = result.details as SshResultDetails | undefined;
-			const isPartial = (_opt as { isPartial?: boolean } | undefined)?.isPartial === true;
+			const isPartial = _opt.isPartial === true;
 			const completed = (isError: boolean) => frameToolResult(text, theme, isError);
 
 			if (details?._type !== "sshResult") {
@@ -1246,6 +1251,6 @@ ctx.ui.notify(`🔐 Remote sudo authentication failed on ${host}`, "error");
 			const out = isPartial ? [...body, ...footer] : ruleFrame(body, footer, termW(), paint);
 			text.setText(fillToolBackground(out.join("\n")));
 			return text;
-		}) as never,
+		},
 	});
 }
