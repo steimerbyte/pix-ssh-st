@@ -8134,7 +8134,8 @@ function index_default(pi) {
       const sessionAlive = hostApproved(approvedHosts, key, Date.now(), SESSION_APPROVAL_TTL_MS);
       const sudoAlive = hostApproved(approvedSudoHosts, key, Date.now(), SUDO_APPROVAL_TTL_MS);
       const sudoOnlyNoPrompt = promptFor.length === 1 && promptFor[0] === "sudo" && sshRunConfig.sudoConfirm === false;
-      const alreadyApproved = action === "command" && (promptFor.length === 0 || sudoOnlyNoPrompt) && (!sshRunConfig.confirm || (privileged ? sudoAlive : sessionAlive));
+      const configFullAutoAllow = sshRunConfig.confirm === false && sshRunConfig.sudoConfirm === false;
+      const alreadyApproved = action === "command" && (configFullAutoAllow || promptFor.length === 0 || sudoOnlyNoPrompt) && (configFullAutoAllow || !sshRunConfig.confirm || (privileged ? sudoAlive : sessionAlive));
       if (alreadyApproved) {
         let kind;
         if (!sshRunConfig.confirm) {
@@ -8222,7 +8223,7 @@ function index_default(pi) {
         }
         return last;
       });
-      const overlayResult = alreadyApproved && !sshRunConfig.confirm ? { action: "approved", password: "" } : await runOverlay();
+      const overlayResult = alreadyApproved ? { action: "approved", password: "" } : await runOverlay();
       const missing = overlayResult.action === "approved" && (needLogin && !collected.login || needSudo && !collected.sudo);
       if (overlayResult.action !== "approved" || missing) {
         const r = cancelResult(command, host, sudo, reason, overlayResult.action);

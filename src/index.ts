@@ -637,10 +637,15 @@ export default function (pi: ExtensionAPI): void {
 				sshRunConfig.sudoConfirm === false;
 			// sshRunConfig.confirm: false → immer erlauben (kein Overlay, Maps
 			// ungenutzt). true (default) → TTL-Map Verhalten des Forks.
+			// configFullAutoAllow: when ssh.json sets BOTH confirm:false AND
+			// sudoConfirm:false, the plugin must NEVER prompt for any auth.
+			// SSH call goes through with empty passwords; remote auth decides.
+			const configFullAutoAllow =
+				sshRunConfig.confirm === false && sshRunConfig.sudoConfirm === false;
 			const alreadyApproved =
 				action === "command" &&
-				(promptFor.length === 0 || sudoOnlyNoPrompt) &&
-				(!sshRunConfig.confirm || (privileged ? sudoAlive : sessionAlive));
+				(configFullAutoAllow || promptFor.length === 0 || sudoOnlyNoPrompt) &&
+				(configFullAutoAllow || !sshRunConfig.confirm || (privileged ? sudoAlive : sessionAlive));
 			if (alreadyApproved) {
 				// confirm:false means config-driven auto-allow, not TTL-reuse.
 				// Pick a kind label that tells the user which path was taken,
@@ -756,7 +761,7 @@ export default function (pi: ExtensionAPI): void {
 			// Config auto-allow: skip runOverlay (no withAgentBlock "SSH approval
 			// required" status-bar event). Otherwise await the real overlay.
 			const overlayResult: OverlayResult =
-				alreadyApproved && !sshRunConfig.confirm
+				alreadyApproved
 					? ({ action: "approved", password: "" } as OverlayResult)
 					: await runOverlay();
 			const missing =
