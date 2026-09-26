@@ -78,6 +78,7 @@ import {
 	truncate,
 	SESSION_APPROVAL_TTL_MS,
 	SUDO_APPROVAL_TTL_MS,
+	loadSshConfig,
 } from "./lib.ts";
 
 const PROMPT_TIMEOUT_MS = 60_000;
@@ -100,6 +101,16 @@ const credCache = new Map<string, HostCreds>();
 // Password prompts are NOT skipped — a still-missing login or sudo password
 // always re-prompts. Each auto-approve emits a visible notify so the decision is
 // never silent. Maps never leave process memory (process exit clears them).
+
+// Local override (read once at plugin load): `~/.pi/agent/ssh.json`. NOT
+// committed to git — the user sets it on their own machine.
+//
+//   confirm: false → immer erlauben. Overlay wird komplett uebergangen,
+//                    Password-Prompt laeuft weiter wenn noetig, die
+//                    approvedHosts / approvedSudoHosts Maps bleiben ungenutzt.
+//   confirm: true  (default) → fork's TTL-Map Verhalten: ein Allow pro Host
+//                    pro Session (non-priv) bzw. 30-min Rolling (sudo).
+const sshRunConfig = loadSshConfig();
 const approvedHosts = new Map<string, number>();
 const approvedSudoHosts = new Map<string, number>();
 
@@ -614,10 +625,12 @@ export default function (pi: ExtensionAPI): void {
 			const privileged = action === "command" && (sudo || commandEscalatesPrivilege(command));
 			const sessionAlive = hostApproved(approvedHosts, key, Date.now(), SESSION_APPROVAL_TTL_MS);
 			const sudoAlive = hostApproved(approvedSudoHosts, key, Date.now(), SUDO_APPROVAL_TTL_MS);
+			// sshRunConfig.confirm: false → immer erlauben (kein Overlay, Maps
+			// ungenutzt). true (default) → TTL-Map Verhalten des Forks.
 			const alreadyApproved =
 				action === "command" &&
 				promptFor.length === 0 &&
-				(privileged ? sudoAlive : sessionAlive);
+				(!sshRunConfig.confirm || (privileged ? sudoAlive : sessionAlive));
 			if (alreadyApproved) {
 				const kind = privileged ? "sudo (30-min)" : "session";
 				ctx.ui.notify(`ssh_run: reused ${kind} approval for ${host}`, "info");

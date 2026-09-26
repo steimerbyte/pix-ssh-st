@@ -1,18 +1,23 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import registerSsh, { validatorFor } from "./index.ts";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
 	baseScpArgs,
 	baseSshArgs,
 	buildRunSshArgs,
 	commandEscalatesPrivilege,
 	controlPathFor,
+	DEFAULT_SSH_RUN_CONFIG,
 	detectSshFailure,
 	detectSudoFailure,
 	filterSudoPrompt,
 	hostApproved,
 	hostTarget,
 	isUnreachable,
+	loadSshConfig,
 	parseHost,
 	parseHostAliases,
 	parseHostInfo,
@@ -313,6 +318,51 @@ describe("commandEscalatesPrivilege", () => {
 		expect(commandEscalatesPrivilege("ls -la")).toBe(false);
 		expect(commandEscalatesPrivilege("pseudo-tty")).toBe(false);
 		expect(commandEscalatesPrivilege("cat sudoku.txt")).toBe(false);
+	});
+});
+
+describe("loadSshConfig", () => {
+	let dir: string;
+	beforeEach(() => {
+		dir = mkdtempSync(join(tmpdir(), "pix-ssh-cfg-"));
+	});
+	afterEach(() => {
+		rmSync(dir, { recursive: true, force: true });
+	});
+	const file = (name: string) => join(dir, name);
+
+	it("returns defaults when the file is missing", () => {
+		expect(loadSshConfig(file("nope.json"))).toEqual(DEFAULT_SSH_RUN_CONFIG);
+	});
+
+	it("reads confirm: false", () => {
+		writeFileSync(file("ssh.json"), JSON.stringify({ confirm: false }));
+		expect(loadSshConfig(file("ssh.json"))).toEqual({ confirm: false });
+	});
+
+	it("reads confirm: true explicitly", () => {
+		writeFileSync(file("ssh.json"), JSON.stringify({ confirm: true }));
+		expect(loadSshConfig(file("ssh.json"))).toEqual({ confirm: true });
+	});
+
+	it("ignores unknown keys and falls back to default confirm", () => {
+		writeFileSync(file("ssh.json"), JSON.stringify({ unknown: 42 }));
+		expect(loadSshConfig(file("ssh.json"))).toEqual(DEFAULT_SSH_RUN_CONFIG);
+	});
+
+	it("ignores malformed JSON", () => {
+		writeFileSync(file("ssh.json"), "{ not valid json");
+		expect(loadSshConfig(file("ssh.json"))).toEqual(DEFAULT_SSH_RUN_CONFIG);
+	});
+
+	it("ignores a non-object root", () => {
+		writeFileSync(file("ssh.json"), JSON.stringify(["confirm", false]));
+		expect(loadSshConfig(file("ssh.json"))).toEqual(DEFAULT_SSH_RUN_CONFIG);
+	});
+
+	it("ignores a non-boolean confirm value", () => {
+		writeFileSync(file("ssh.json"), JSON.stringify({ confirm: "off" }));
+		expect(loadSshConfig(file("ssh.json"))).toEqual(DEFAULT_SSH_RUN_CONFIG);
 	});
 });
 

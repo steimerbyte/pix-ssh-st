@@ -92,6 +92,70 @@ export function commandEscalatesPrivilege(command: string): boolean {
 	return /(^|[\s;&|(])(sudo|su|doas|pkexec)\b/.test(command);
 }
 
+// ── Local config override ────────────────────────────────────────────────────
+
+/**
+ * User-overridable config, read from `~/.pi/agent/ssh.json` at plugin load.
+ * Intentionally outside the repo so the file is never committed by accident.
+ * Missing file → fork defaults apply. Malformed JSON or wrong shape → warning
+ * to stderr, fork defaults apply. Never throws.
+ */
+export interface SshRunConfig {
+	/**
+	 * When `false`, every ssh_run command is auto-approved without showing the
+	 * confirmation overlay — the per-host approval-map TTLs are ignored.
+	 * Password prompts still run when a login/sudo password is missing.
+	 * Lets a local user lock the fork into "immer erlauben" mode for their
+	 * own machine without editing package code.
+	 *
+	 * When `true` (default), the fork's TTL-map behavior applies: one Allow
+	 * per host per session (non-priv, Infinity) and a 30-min rolling window
+	 * for sudo.
+	 */
+	confirm: boolean;
+}
+
+/** What the plugin uses when no config file is present. */
+export const DEFAULT_SSH_RUN_CONFIG: SshRunConfig = {
+	confirm: true,
+};
+
+/** Default path to the local config file. */
+export const DEFAULT_SSH_RUN_CONFIG_PATH = join(homedir(), ".pi", "agent", "ssh.json");
+
+/**
+ * Read and validate the local config. Returns the fork defaults when the file
+ * is missing, malformed, or carries the wrong shape. The path is injectable so
+ * tests use a temp file instead of touching the user's real config.
+ */
+export function loadSshConfig(path: string = DEFAULT_SSH_RUN_CONFIG_PATH): SshRunConfig {
+	let text: string;
+	try {
+		text = readFileSync(path, "utf8");
+	} catch {
+		return DEFAULT_SSH_RUN_CONFIG;
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(text);
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		process.stderr.write(`ssh_run: ignoring malformed ${path}: ${msg}\n`);
+		return DEFAULT_SSH_RUN_CONFIG;
+	}
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+		process.stderr.write(`ssh_run: ignoring ${path} — expected JSON object\n`);
+		return DEFAULT_SSH_RUN_CONFIG;
+	}
+	const obj = parsed as Record<string, unknown>;
+	if (!("confirm" in obj)) return DEFAULT_SSH_RUN_CONFIG;
+	if (typeof obj.confirm !== "boolean") {
+		process.stderr.write(`ssh_run: ignoring ${path} — "confirm" must be boolean\n`);
+		return DEFAULT_SSH_RUN_CONFIG;
+	}
+	return { confirm: obj.confirm };
+}
+
 /** ControlPersist window (seconds) — the multiplexed connection lingers this
  * long after the last call, so repeat commands skip re-auth. */
 const CONTROL_PERSIST_SECONDS = 120;
