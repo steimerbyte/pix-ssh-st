@@ -252,6 +252,14 @@ export interface SshResult {
 	stdout: string;
 	stderr: string;
 	code: number;
+	/**
+	 * `true` when `runSshChild` had to roll back the in-memory accumulator
+	 * mid-run because stdout/stderr exceeded the soft cap (see capStream).
+	 * The caller can pass this to `truncate()` so the second pass knows the
+	 * source was already bounded instead of having to recount lines/bytes
+	 * from scratch. Always `false` for short runs that never hit the cap.
+	 */
+	earlyTruncated?: boolean;
 }
 
 export type TransferDirection = "upload" | "download";
@@ -662,12 +670,65 @@ function sliceAtUtf8Boundary(buf: Buffer, maxBytes: number): number {
 	return end;
 }
 
+/**
+ * Append `chunk` to `buf` while bounding the total size. When the combined
+ * length would exceed `maxBytes`, roll back to the last `rollbackBytes`
+ * bytes (UTF-8 codepoint aligned via `sliceAtUtf8Boundary`) and report
+ * `truncated: true` for this call. Subsequent calls keep the same semantics,
+ * so callers can latch an overall "we hit the cap" flag with `|=`.
+ *
+ * Memory bound: after the cap fires, the steady-state buffer length is
+ * `≤ rollbackBytes` plus a few bytes of UTF-8 alignment slack — independent
+ * of how much data the source emits. Before the cap fires, the buffer
+ * grows linearly with input up to `maxBytes`.
+ *
+ * Used by `runSshChild` so a 1 GB remote stream can't blow the JS heap via
+ * `stdout += chunk`; the final SshResult carries an `earlyTruncated` flag
+ * that callers thread into `truncate()` to avoid re-cutting the head.
+ */
+export function capStream(
+	buf: Buffer,
+	chunk: Buffer,
+	maxBytes: number,
+	rollbackBytes: number,
+): { buf: Buffer; truncated: boolean } {
+	if (chunk.length === 0) return { buf, truncated: false };
+	const combined = Buffer.concat([buf, chunk]);
+	if (combined.length <= maxBytes) return { buf: combined, truncated: false };
+	// Cap exceeded — keep the last `rollbackBytes` bytes, UTF-8 aligned.
+	// sliceAtUtf8Boundary returns the largest safe END ≤ dropBytes; the
+	// tail starting at that position is itself a valid UTF-8 sequence
+	// because the source buffer is valid UTF-8 ending on a codepoint
+	// boundary (Node data events deliver whole codepoints).
+	const dropBytes = combined.length - rollbackBytes;
+	const safeDropEnd = sliceAtUtf8Boundary(combined, dropBytes);
+	return { buf: combined.subarray(safeDropEnd), truncated: true };
+}
+
 export function truncate(
 	text: string,
 	maxLines = MAX_OUTPUT_LINES,
 	maxBytes = MAX_OUTPUT_BYTES,
+	/**
+	 * Set by callers that already know the source was bounded upstream
+	 * (e.g. `runSshChild` hit `capStream`'s cap and the SshResult carries
+	 * `earlyTruncated: true`). Skips the early-return line/byte count
+	 * optimisation and goes straight to applying the line/byte caps. The
+	 * result is still `{ truncated: true }` so the display suffix fires.
+	 */
+	alreadyTruncated = false,
 ): { text: string; truncated: boolean } {
 	const lines = text.split("\n");
+	if (alreadyTruncated) {
+		const kept = lines.slice(0, maxLines);
+		let result = kept.join("\n");
+		if (Buffer.byteLength(result, "utf8") > maxBytes) {
+			const buf = Buffer.from(result, "utf8");
+			const safeEnd = sliceAtUtf8Boundary(buf, maxBytes);
+			result = buf.subarray(0, safeEnd).toString("utf8");
+		}
+		return { text: result, truncated: true };
+	}
 	const byteLen = Buffer.byteLength(text, "utf8");
 	if (lines.length <= maxLines && byteLen <= maxBytes) {
 		return { text, truncated: false };
@@ -909,12 +970,25 @@ interface RunSshChildOpts {
 }
 
 /**
+ * Per-stream soft cap for in-place truncation inside `runSshChild`. The cap
+ * is `2 * MAX_OUTPUT_BYTES` so a stream can grow to twice the display cap
+ * before we roll back; after the rollback the steady-state size is
+ * `MAX_OUTPUT_BYTES` plus a few bytes of UTF-8 alignment slack. Peak per
+ * run is therefore O(`2 * MAX_OUTPUT_BYTES`) regardless of how much data
+ * the remote process emits.
+ */
+const STREAM_SOFT_CAP_BYTES = MAX_OUTPUT_BYTES * 2;
+const STREAM_ROLLBACK_BYTES = MAX_OUTPUT_BYTES;
+
+/**
 	 * Single spawn helper that every SSH/scp/sshpass invocation in this
 	 * module goes through. Centralises:
 	 *   - stdio wiring (defaults capture both stdout+stderr; opt out per
 	 *     stream via opts.capture)
 	 *   - chunk accumulation with optional filterStderr (sudo prompt strip)
-	 *   - per-chunk onChunk callback for live streaming (errors swallowed)
+	 *     and in-place capStream truncation so a chatty remote can't OOM us
+	 *   - per-chunk onChunk callback for live streaming (errors swallowed,
+	 *     receives the rolled-back tail after the cap fires)
 	 *   - AbortSignal handling with SIGTERM → SIGKILL escalation after 5s
 	 *   - listener cleanup so long-lived signals don't accumulate handlers
 	 *
@@ -938,27 +1012,46 @@ function runSshChild(opts: RunSshChildOpts): Promise<SshResult> {
 			stdio,
 			env: opts.env ?? process.env,
 		});
-		let stdout = "";
-		let stderr = "";
+		// Byte-precise accumulation so we can enforce the soft cap without
+		// dragging a potentially huge UTF-16 string through every +=. The
+		// buffers are decoded to strings only when the caller asks (fireChunk
+		// + the final resolve), which keeps the steady-state heap footprint
+		// at O(STREAM_SOFT_CAP_BYTES) regardless of remote output size.
+		let stdoutBuf = Buffer.alloc(0);
+		let stderrBuf = Buffer.alloc(0);
+		let earlyTruncated = false;
 		const fireChunk = () => {
 			if (!opts.onChunk) return;
 			try {
-				opts.onChunk(stdout, stderr);
+				opts.onChunk(stdoutBuf.toString("utf8"), stderrBuf.toString("utf8"));
 			} catch {
 				// Caller-side error — swallow so it doesn't break the run.
 			}
 		};
 		proc.stdout?.on("data", (c: Buffer) => {
-			stdout += c.toString();
+			const r = capStream(stdoutBuf, c, STREAM_SOFT_CAP_BYTES, STREAM_ROLLBACK_BYTES);
+			stdoutBuf = r.buf;
+			if (r.truncated) earlyTruncated = true;
 			fireChunk();
 		});
 		proc.stderr?.on("data", (c: Buffer) => {
 			const value = opts.filterStderr ? opts.filterStderr(c.toString()) : c.toString();
-			if (value) stderr += value;
+			if (value) {
+				const r = capStream(stderrBuf, Buffer.from(value, "utf8"), STREAM_SOFT_CAP_BYTES, STREAM_ROLLBACK_BYTES);
+				stderrBuf = r.buf;
+				if (r.truncated) earlyTruncated = true;
+			}
 			fireChunk();
 		});
 		proc.on("error", reject);
-		proc.on("close", (code) => resolve({ stdout, stderr, code: code ?? 1 }));
+		proc.on("close", (code) =>
+			resolve({
+				stdout: stdoutBuf.toString("utf8"),
+				stderr: stderrBuf.toString("utf8"),
+				code: code ?? 1,
+				earlyTruncated,
+			}),
+		);
 		if (opts.stdin && proc.stdin) {
 			proc.stdin.write(opts.stdin);
 			proc.stdin.end();

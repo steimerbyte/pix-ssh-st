@@ -1068,7 +1068,12 @@ ctx.ui.notify(`🔐 Remote sudo authentication failed on ${host}`, "error");
 			}
 
 			const combined = [result.stdout, result.stderr].filter(Boolean).join("\n") || "(no output)";
-			const { text: truncatedText, truncated } = truncate(combined);
+			// earlyTruncated comes from runSshChild's in-place capStream: when
+			// set, the source was already bounded at MAX_OUTPUT_BYTES * 2 per
+			// stream, so truncate() skips the line/byte count short-circuit
+			// and goes straight to applying the display caps. The suffix
+			// message still fires (truncated === true either way).
+			const { text: truncatedText, truncated } = truncate(combined, undefined, undefined, result.earlyTruncated);
 			const suffix = truncated
 				? `\n\n[Output truncated to ${MAX_OUTPUT_LINES} lines / ${MAX_OUTPUT_BYTES / 1024}KB]`
 				: "";

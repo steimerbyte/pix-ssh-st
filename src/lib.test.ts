@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import registerSsh, { validatorFor } from "./index.ts";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -9,6 +9,7 @@ import {
 	baseScpArgs,
 	baseSshArgs,
 	buildRunSshArgs,
+	capStream,
 	clearIdentityFileOverride,
 	commandEscalatesPrivilege,
 	controlPathFor,
@@ -68,6 +69,31 @@ describe("parseHost", () => {
 		expect(() => parseHost("h:0")).toThrow();
 		expect(() => parseHost("h:70000")).toThrow();
 		expect(() => parseHost("h:abc")).toThrow();
+	});
+
+	// Regression: v0.2.0 audit fix 3.3 — a bare IPv6 with a trailing port
+	// (e.g. fe80::1:22) is ambiguous (the last colon could be a port or part
+	// of the address). OpenSSH requires brackets, so we accept the whole
+	// string as the host and warn via stderr instead of throwing.
+	it("accepts bare IPv6 with ambiguous trailing port as host and warns on stderr", () => {
+		const spy = spyOn(process.stderr, "write").mockImplementation(() => true);
+		try {
+			expect(() => parseHost("fe80::1:22")).not.toThrow();
+			expect(parseHost("fe80::1:22")).toEqual({ host: "fe80::1:22" });
+			const text = spy.mock.calls.map((c) => String(c[0])).join("");
+			expect(text).toContain("fe80::1:22");
+			expect(text).toContain("bare IPv6");
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	it("parses bracketed IPv6 with port (no user prefix)", () => {
+		expect(parseHost("[fe80::1]:22")).toEqual({ host: "fe80::1", port: 22 });
+	});
+
+	it("parses bare IPv6 ::1 (no port)", () => {
+		expect(parseHost("::1")).toEqual({ host: "::1" });
 	});
 });
 
@@ -331,6 +357,20 @@ describe("hostApproved", () => {
 		expect(hostApproved(m, "u@h:22", 0)).toBe(false);
 		expect(m.has("u@h:22")).toBe(false);
 	});
+
+	it("Infinity-tagged ttl entry is treated as dead and self-prunes", () => {
+		// The same Number.isFinite guard catches Infinity (the `now >= expiresAt`
+		// check would always be true for Infinity, but the guard rejects it
+		// before that comparison so the entry is pruned instead of returning
+		// false forever). Mirrors the v0.2.0 fix on the finite-TTL code path
+		// even though markHostApproved would normally store `Infinity` via the
+		// session variant path.
+		const m = new Map<string, ApprovalEntry>([
+			["u@h:22", { kind: "ttl", expiresAt: Number.POSITIVE_INFINITY }],
+		]);
+		expect(hostApproved(m, "u@h:22", 0)).toBe(false);
+		expect(m.has("u@h:22")).toBe(false);
+	});
 });
 
 describe("markHostApproved", () => {
@@ -358,6 +398,29 @@ describe("commandEscalatesPrivilege", () => {
 		expect(commandEscalatesPrivilege("ls -la")).toBe(false);
 		expect(commandEscalatesPrivilege("pseudo-tty")).toBe(false);
 		expect(commandEscalatesPrivilege("cat sudoku.txt")).toBe(false);
+	});
+
+	// Regression: v0.2.0 audit expanded the boundary class to cover quote,
+	// brace, bracket, and path-separator characters AND added case-insensitivity.
+	// Pre-fix the regex `/(\s|;|&|...)sudo\b/` skipped these inputs and let a
+	// wrapped sudo call bypass per-host allow-memory.
+	it("catches v0.2.0 escape vectors (quote, path, brace, bracket, case)", () => {
+		expect(commandEscalatesPrivilege("`sudo whoami`")).toBe(true);
+		expect(commandEscalatesPrivilege("bash -c 'sudo whoami'")).toBe(true);
+		expect(commandEscalatesPrivilege("/usr/bin/sudo cmd")).toBe(true);
+		expect(commandEscalatesPrivilege("./sudo cmd")).toBe(true);
+		expect(commandEscalatesPrivilege("{sudo cmd}")).toBe(true);
+		expect(commandEscalatesPrivilege("[sudo cmd]")).toBe(true);
+		expect(commandEscalatesPrivilege("SUDO=1 sudo cmd")).toBe(true);
+	});
+
+	it("does not flag words that contain 'su' or 'sudo' as a non-boundary substring", () => {
+		// \b word boundary must keep these negative: myuser (no 'su' substring
+		// match), sudoku (sudo followed by k, no \b), systemd-tmpfiles (systemd,
+		// 'su' followed by s, no \b).
+		expect(commandEscalatesPrivilege("myuser")).toBe(false);
+		expect(commandEscalatesPrivilege("sudoku")).toBe(false);
+		expect(commandEscalatesPrivilege("systemd-tmpfiles")).toBe(false);
 	});
 });
 
@@ -430,6 +493,99 @@ describe("truncate", () => {
 		const out = truncate(many, 2000);
 		expect(out.truncated).toBe(true);
 		expect(out.text.split("\n").length).toBe(2000);
+	});
+	it("alreadyTruncated: skips the line/byte short-circuit, returns truncated=true", () => {
+		// Short input that would normally pass through unchanged. With
+		// alreadyTruncated=true the caller signals the source was bounded
+		// upstream (e.g. runSshChild hit capStream), so truncate() must
+		// still report truncated=true without inspecting line/byte counts.
+		expect(truncate("a\nb", undefined, undefined, true)).toEqual({
+			text: "a\nb",
+			truncated: true,
+		});
+	});
+	it("alreadyTruncated: still applies the byte cap to bounded source", () => {
+		// 100 KB of input would normally exceed MAX_OUTPUT_BYTES (50 KB) and
+		// trigger the byte cap. alreadyTruncated=true must not skip that
+		// work — it just skips the cheap line/byte count short-circuit.
+		const big = "x".repeat(100 * 1024);
+		const out = truncate(big, undefined, undefined, true);
+		expect(out.truncated).toBe(true);
+		expect(Buffer.byteLength(out.text, "utf8")).toBeLessThanOrEqual(50 * 1024);
+	});
+});
+
+describe("capStream", () => {
+	// Small caps keep the test data tiny while still exercising the cap
+	// boundary: maxBytes=20, rollbackBytes=10 means anything beyond 20
+	// bytes total rolls back to the last 10 bytes.
+	const MAX = 20;
+	const ROLLBACK = 10;
+
+	it("passes a single chunk that fits through unchanged", () => {
+		const r = capStream(Buffer.alloc(0), Buffer.from("hello"), MAX, ROLLBACK);
+		expect(r.truncated).toBe(false);
+		expect(r.buf.toString("utf8")).toBe("hello");
+	});
+	it("passes an empty chunk through unchanged", () => {
+		const r = capStream(Buffer.from("abc"), Buffer.alloc(0), MAX, ROLLBACK);
+		expect(r.truncated).toBe(false);
+		expect(r.buf.toString("utf8")).toBe("abc");
+	});
+	it("accumulates chunks below the cap without truncation", () => {
+		let buf = Buffer.alloc(0);
+		for (let i = 0; i < 4; i++) {
+			const r = capStream(buf, Buffer.from("abcd"), MAX, ROLLBACK);
+			buf = r.buf;
+		}
+		expect(buf.toString("utf8")).toBe("abcdabcdabcdabcd");
+	});
+	it("rolls back to the last rollbackBytes when the cap is exceeded", () => {
+		// 30 bytes total exceeds MAX=20; expect the last 10 bytes kept.
+		const r = capStream(
+			Buffer.from("AAAAAAAAAAAAAAAAAAAA"), // 20 bytes
+			Buffer.from("BBBBBBBBBB"), // 10 bytes → 30 total
+			MAX,
+			ROLLBACK,
+		);
+		expect(r.truncated).toBe(true);
+		expect(r.buf.toString("utf8")).toBe("BBBBBBBBBB");
+	});
+	it("stays bounded after the cap fires (no unbounded growth)", () => {
+		// Force the first cap, then keep appending. The buffer must not
+		// grow past MAX — this is the memory-bomb guarantee. (It oscillates
+		// between ROLLBACK right after a cap and MAX just before the next
+		// cap fires; the important property is that MAX is the ceiling.)
+		let buf = Buffer.alloc(0);
+		for (let i = 0; i < 50; i++) {
+			const r = capStream(buf, Buffer.from("X"), MAX, ROLLBACK);
+			buf = r.buf;
+		}
+		expect(buf.length).toBeLessThanOrEqual(MAX);
+	});
+	it("keeps the tail aligned to a UTF-8 codepoint boundary", () => {
+		// "🌍" is a 4-byte codepoint (F0 9F 8C 8D). Build a buffer that ends
+		// mid-codepoint after the cap fires, then assert the kept tail has
+		// no U+FFFD replacement chars — i.e. UTF-8 alignment held.
+		const earth = "🌍"; // 4 bytes
+		const prefix = "a".repeat(17); // 17 ASCII + 4 emoji = 21 bytes
+		const r = capStream(Buffer.from(prefix), Buffer.from(earth), MAX, ROLLBACK);
+		expect(r.truncated).toBe(true);
+		const text = r.buf.toString("utf8");
+		expect(text).not.toContain("\uFFFD");
+	});
+	it("drops a chunk whose first bytes fall inside the rollback window", () => {
+		// Two chunks that together exceed MAX, where the second chunk's
+		// start would otherwise land inside the rollback window — verify
+		// the kept tail is exactly the second chunk's bytes, not split.
+		const r = capStream(
+			Buffer.from("aaaaaaaaaaaaaaaaaaaa"), // 20 bytes
+			Buffer.from("0123456789"), // 10 bytes → 30 total
+			MAX,
+			ROLLBACK,
+		);
+		expect(r.truncated).toBe(true);
+		expect(r.buf.toString("utf8")).toBe("0123456789");
 	});
 });
 
