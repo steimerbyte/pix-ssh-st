@@ -659,6 +659,21 @@ export default function (pi: ExtensionAPI): void {
 					kind = "session";
 				}
 				ctx.ui.notify(`ssh_run: auto allow turned on via ${kind} — ${host}`, "info");
+				// TUI: when config auto-allows, skip the "Awaiting approval…" message
+				// in the result pane by jumping straight to "running" with the
+				// auto-allow kind in the text. The later updatePresentation call
+				// (after runOverlay) overwrites this once execution starts.
+				if (!sshRunConfig.confirm) {
+					updatePresentation(
+						onUpdate,
+						command,
+						host,
+						sudo,
+						reason,
+						"running",
+						`Auto allow via ${kind} — running on ${host}…`,
+					);
+				}
 			} else if (transferDecision === "allow") {
 				ctx.ui.notify(
 					`⚠ ssh_run file transfer auto-approved — ${mode.toUpperCase()} warning policy`,
@@ -738,7 +753,12 @@ export default function (pi: ExtensionAPI): void {
 					return last;
 				});
 
-			const overlayResult = await runOverlay();
+			// Config auto-allow: skip runOverlay (no withAgentBlock "SSH approval
+			// required" status-bar event). Otherwise await the real overlay.
+			const overlayResult: OverlayResult =
+				alreadyApproved && !sshRunConfig.confirm
+					? ({ action: "approved", password: "" } as OverlayResult)
+					: await runOverlay();
 			const missing =
 				overlayResult.action === "approved" &&
 				((needLogin && !collected.login) || (needSudo && !collected.sudo));

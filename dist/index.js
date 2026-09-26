@@ -8147,6 +8147,17 @@ function index_default(pi) {
           kind = "session";
         }
         ctx.ui.notify(`ssh_run: auto allow turned on via ${kind} \u2014 ${host}`, "info");
+        if (!sshRunConfig.confirm) {
+          updatePresentation(
+            onUpdate,
+            command,
+            host,
+            sudo,
+            reason,
+            "running",
+            `Auto allow via ${kind} \u2014 running on ${host}\u2026`
+          );
+        }
       } else if (transferDecision === "allow") {
         ctx.ui.notify(
           `\u26A0 ssh_run file transfer auto-approved \u2014 ${mode.toUpperCase()} warning policy`,
@@ -8211,7 +8222,7 @@ function index_default(pi) {
         }
         return last;
       });
-      const overlayResult = await runOverlay();
+      const overlayResult = alreadyApproved && !sshRunConfig.confirm ? { action: "approved", password: "" } : await runOverlay();
       const missing = overlayResult.action === "approved" && (needLogin && !collected.login || needSudo && !collected.sudo);
       if (overlayResult.action !== "approved" || missing) {
         const r = cancelResult(command, host, sudo, reason, overlayResult.action);
