@@ -1,6 +1,6 @@
 {
 	"name": "@steimerbyte/pix-ssh-st",
-	"version": "0.2.3",
+	"version": "0.2.4",
 	"description": "Pi tool — ssh_run with fork policy: approve once per session (non-privileged) + 30-min rolling window for sudo commands.",
 	"type": "module",
 	"main": "dist/index.js",
