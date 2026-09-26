@@ -506,6 +506,15 @@ export function setIdentityFileOverride(path: string | undefined): void {
 	identityFileOverride = path;
 }
 
+/**
+ * Reset the module-level override to undefined. Tests use this to isolate
+ * from state set by `loadSshConfig()` at plugin load time; production code
+ * should call `setIdentityFileOverride` with the explicit path instead.
+ */
+export function clearIdentityFileOverride(): void {
+	identityFileOverride = undefined;
+}
+
 /** Base ssh options shared by every invocation: multiplexing + timeouts +
  * non-interactive prompts (BatchMode is toggled by the caller). */
 function connectionArgs(spec: HostSpec, controlPath: string, portFlag: "-p" | "-P"): string[] {
@@ -795,6 +804,13 @@ export interface RunOptions {
 	sudoPassword?: string;
 	controlPath: string;
 	signal?: AbortSignal;
+	/**
+	 * Fired on every stdout/stderr chunk during the run so the caller can
+	 * stream partial output back to the UI. Receives the accumulated
+	 * stdout + stderr so far (filterStderr already applied to stderr).
+	 * The caller is responsible for throttling the resulting UI pushes.
+	 */
+	onChunk?: (stdout: string, stderr: string) => void;
 }
 
 /**
@@ -808,7 +824,7 @@ export function runTransfer(
 	source: string,
 	destination: string,
 	recursive: boolean,
-	opts: Pick<RunOptions, "controlPath" | "loginPassword" | "signal">,
+	opts: Pick<RunOptions, "controlPath" | "loginPassword" | "signal" | "onChunk">,
 ): Promise<SshResult> {
 	const endpoint = ["--", ...transferArgs(spec, direction, source, destination)];
 	const bin = opts.loginPassword ? SSHPASS_BIN : SCP_BIN;
@@ -818,7 +834,7 @@ export function runTransfer(
 		? ["-e", "scp", ...baseScpArgs(spec, opts.controlPath, recursive), ...endpoint]
 		: [...baseScpArgs(spec, opts.controlPath, recursive), "-o", "BatchMode=yes", ...endpoint];
 	const env = opts.loginPassword ? { ...process.env, [SSHPASS_ENV]: opts.loginPassword } : process.env;
-	return spawnResult(bin, args, env, opts.signal);
+	return spawnResult(bin, args, env, opts.signal, undefined, undefined, opts.onChunk);
 }
 
 /**
@@ -850,7 +866,7 @@ export function runSsh(spec: HostSpec, command: string, opts: RunOptions): Promi
 	// Remote sudo reads its password from stdin (first line); anything else
 	// closes stdin so the remote command sees EOF.
 	const stdin = opts.sudo && opts.sudoPassword !== undefined ? `${opts.sudoPassword}\n` : undefined;
-	return spawnResult(bin, args, env, opts.signal, opts.sudo ? filterSudoPrompt : undefined, stdin);
+	return spawnResult(bin, args, env, opts.signal, opts.sudo ? filterSudoPrompt : undefined, stdin, opts.onChunk);
 }
 
 function spawnResult(
@@ -860,17 +876,31 @@ function spawnResult(
 	sig?: AbortSignal,
 	filterStderr?: (value: string) => string,
 	stdin?: string,
+	onChunk?: (stdout: string, stderr: string) => void,
 ): Promise<SshResult> {
 	return new Promise((resolve, reject) => {
 		const proc = spawn(bin, args, { stdio: ["pipe", "pipe", "pipe"], env });
 		let stdout = "";
 		let stderr = "";
+		// Helper: invoke onChunk without throwing into the data handler. If the
+		// caller's handler throws, we'd otherwise lose the chunk and possibly
+		// reject the whole run.
+		const fire = () => {
+			if (!onChunk) return;
+			try {
+				onChunk(stdout, stderr);
+			} catch {
+				// Caller-side error — swallow so we don't break the run.
+			}
+		};
 		proc.stdout.on("data", (c: Buffer) => {
 			stdout += c.toString();
+			fire();
 		});
 		proc.stderr.on("data", (c: Buffer) => {
 			const value = filterStderr ? filterStderr(c.toString()) : c.toString();
 			if (value) stderr += value;
+			fire();
 		});
 		proc.on("error", reject);
 		proc.on("close", (code) => resolve({ stdout, stderr, code: code ?? 1 }));

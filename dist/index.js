@@ -7786,7 +7786,7 @@ function runTransfer(spec, direction, source, destination, recursive, opts) {
   const bin = opts.loginPassword ? SSHPASS_BIN : SCP_BIN;
   const args = opts.loginPassword ? ["-e", "scp", ...baseScpArgs(spec, opts.controlPath, recursive), ...endpoint] : [...baseScpArgs(spec, opts.controlPath, recursive), "-o", "BatchMode=yes", ...endpoint];
   const env = opts.loginPassword ? { ...process.env, [SSHPASS_ENV]: opts.loginPassword } : process.env;
-  return spawnResult(bin, args, env, opts.signal);
+  return spawnResult(bin, args, env, opts.signal, void 0, void 0, opts.onChunk);
 }
 function buildRunSshArgs(spec, command, opts) {
   const remote = remoteCommand(command, opts.sudo === true);
@@ -7801,19 +7801,28 @@ function runSsh(spec, command, opts) {
   const env = opts.loginPassword ? { ...process.env, [SSHPASS_ENV]: opts.loginPassword } : process.env;
   const stdin = opts.sudo && opts.sudoPassword !== void 0 ? `${opts.sudoPassword}
 ` : void 0;
-  return spawnResult(bin, args, env, opts.signal, opts.sudo ? filterSudoPrompt : void 0, stdin);
+  return spawnResult(bin, args, env, opts.signal, opts.sudo ? filterSudoPrompt : void 0, stdin, opts.onChunk);
 }
-function spawnResult(bin, args, env, sig, filterStderr, stdin) {
+function spawnResult(bin, args, env, sig, filterStderr, stdin, onChunk) {
   return new Promise((resolve, reject) => {
     const proc = spawn2(bin, args, { stdio: ["pipe", "pipe", "pipe"], env });
     let stdout = "";
     let stderr = "";
+    const fire = () => {
+      if (!onChunk) return;
+      try {
+        onChunk(stdout, stderr);
+      } catch {
+      }
+    };
     proc.stdout.on("data", (c) => {
       stdout += c.toString();
+      fire();
     });
     proc.stderr.on("data", (c) => {
       const value = filterStderr ? filterStderr(c.toString()) : c.toString();
       if (value) stderr += value;
+      fire();
     });
     proc.on("error", reject);
     proc.on("close", (code) => resolve({ stdout, stderr, code: code ?? 1 }));
@@ -8345,6 +8354,61 @@ function index_default(pi) {
       };
       if (action === "file") updateTransferPresentation();
       else updatePresentation(onUpdate, command, host, sudo, reason, "running");
+      const STREAM_THROTTLE_MS = 150;
+      const STREAM_MAX_LINES = 20;
+      const STREAM_MAX_BYTES = 4 * 1024;
+      let streamBuffer = { stdout: "", stderr: "" };
+      let streamLastPush = 0;
+      let streamPending;
+      const fmtStreamTail = () => {
+        const merged = [streamBuffer.stdout, streamBuffer.stderr].filter(Boolean).join("\n");
+        if (!merged) return "";
+        const lines = merged.split("\n");
+        const tail = lines.slice(-STREAM_MAX_LINES).join("\n");
+        let trimmed = tail;
+        if (Buffer.byteLength(tail, "utf8") > STREAM_MAX_BYTES) {
+          const buf = Buffer.from(tail, "utf8");
+          let end = buf.length;
+          while (end > 0 && Buffer.byteLength(buf.subarray(0, end).toString("utf8"), "utf8") > STREAM_MAX_BYTES) {
+            end = Math.max(0, end - Math.ceil(STREAM_MAX_BYTES * 0.1));
+          }
+          trimmed = buf.subarray(0, end).toString("utf8");
+        }
+        const dropped = lines.length - tail.split("\n").length + (merged !== tail ? 1 : 0);
+        const dropHint = dropped > 0 ? `
+[...${dropped} earlier lines hidden, streaming tail...]` : "\n[streaming...]";
+        return `${trimmed}${dropHint}`;
+      };
+      const pushStreamUpdate = () => {
+        if (!onUpdate) return;
+        const now = Date.now();
+        const elapsed = now - streamLastPush;
+        const doIt = () => {
+          streamLastPush = Date.now();
+          streamPending = void 0;
+          onUpdate({
+            content: [
+              {
+                type: "text",
+                text: `${SPINNER[spinnerFrame] ?? ""} Running on ${host}\u2026
+
+${fmtStreamTail()}`
+              }
+            ],
+            details: makeDetails(command, host, sudo, reason, { outcome: "running" })
+          });
+        };
+        if (elapsed >= STREAM_THROTTLE_MS) {
+          doIt();
+        } else if (!streamPending) {
+          streamPending = setTimeout(doIt, STREAM_THROTTLE_MS - elapsed);
+        }
+      };
+      const onChunk = (out, err) => {
+        streamBuffer.stdout = out;
+        streamBuffer.stderr = err;
+        pushStreamUpdate();
+      };
       const spinnerTimer = action === "file" && onUpdate ? setInterval(() => {
         spinnerFrame = (spinnerFrame + 1) % SPINNER.length;
         updateTransferPresentation();
@@ -8354,13 +8418,15 @@ function index_default(pi) {
         result = action === "file" ? await runTransfer(spec, direction ?? "upload", source, destination, recursive, {
           controlPath,
           ...loginPassword ? { loginPassword } : {},
-          ...sig ? { signal: sig } : {}
+          ...sig ? { signal: sig } : {},
+          onChunk
         }) : await runSsh(spec, command, {
           controlPath,
           ...loginPassword ? { loginPassword } : {},
           sudo,
           ...sudo ? { sudoPassword: sudoPassword ?? "" } : {},
-          ...sig ? { signal: sig } : {}
+          ...sig ? { signal: sig } : {},
+          onChunk
         });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -8379,6 +8445,7 @@ function index_default(pi) {
         };
       } finally {
         if (spinnerTimer) clearInterval(spinnerTimer);
+        if (streamPending) clearTimeout(streamPending);
       }
       if (!result) {
         return {

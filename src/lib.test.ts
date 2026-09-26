@@ -8,6 +8,7 @@ import {
 	baseScpArgs,
 	baseSshArgs,
 	buildRunSshArgs,
+	clearIdentityFileOverride,
 	commandEscalatesPrivilege,
 	controlPathFor,
 	DEFAULT_SSH_RUN_CONFIG,
@@ -31,6 +32,13 @@ import {
 } from "./lib.ts";
 
 describe("parseHost", () => {
+	beforeEach(() => {
+		// clearIdentityFileOverride is not relevant for parseHost but keeps
+		// module-state-clean between tests so connectionArgs tests are not
+		// affected by leftover ssh.json state.
+		clearIdentityFileOverride();
+	});
+
 	it("parses bare host", () => {
 		expect(parseHost("example.com")).toEqual({ host: "example.com" });
 	});

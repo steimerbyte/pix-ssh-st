@@ -861,6 +861,68 @@ export default function (pi: ExtensionAPI): void {
 			};
 			if (action === "file") updateTransferPresentation();
 			else updatePresentation(onUpdate, command, host, sudo, reason, "running");
+
+			// Live-stream partial output to the UI during the run. Throttled to
+			// 150ms (trailing edge) so a chatty command does not flood the
+			// render pipeline but the user still sees movement. Each partial
+			// push carries a 20-line / 4KB tail of accumulated output plus a
+			// compact header so the render-result's running branch has
+			// something to show.
+			const STREAM_THROTTLE_MS = 150;
+			const STREAM_MAX_LINES = 20;
+			const STREAM_MAX_BYTES = 4 * 1024;
+			let streamBuffer = { stdout: "", stderr: "" };
+			let streamLastPush = 0;
+			let streamPending: ReturnType<typeof setTimeout> | undefined;
+			const fmtStreamTail = () => {
+				const merged = [streamBuffer.stdout, streamBuffer.stderr]
+					.filter(Boolean)
+					.join("\n");
+				if (!merged) return "";
+				const lines = merged.split("\n");
+				const tail = lines.slice(-STREAM_MAX_LINES).join("\n");
+				let trimmed = tail;
+				if (Buffer.byteLength(tail, "utf8") > STREAM_MAX_BYTES) {
+					const buf = Buffer.from(tail, "utf8");
+					let end = buf.length;
+					while (end > 0 && Buffer.byteLength(buf.subarray(0, end).toString("utf8"), "utf8") > STREAM_MAX_BYTES) {
+						end = Math.max(0, end - Math.ceil(STREAM_MAX_BYTES * 0.1));
+					}
+					trimmed = buf.subarray(0, end).toString("utf8");
+				}
+				const dropped = lines.length - tail.split("\n").length + (merged !== tail ? 1 : 0);
+				const dropHint = dropped > 0 ? `\n[...${dropped} earlier lines hidden, streaming tail...]` : "\n[streaming...]";
+				return `${trimmed}${dropHint}`;
+			};
+			const pushStreamUpdate = () => {
+				if (!onUpdate) return;
+				const now = Date.now();
+				const elapsed = now - streamLastPush;
+				const doIt = () => {
+					streamLastPush = Date.now();
+					streamPending = undefined;
+					onUpdate({
+						content: [
+							{
+								type: "text",
+								text: `${SPINNER[spinnerFrame] ?? ""} Running on ${host}…\n\n${fmtStreamTail()}`,
+							},
+						],
+						details: makeDetails(command, host, sudo, reason, { outcome: "running" }),
+					});
+				};
+				if (elapsed >= STREAM_THROTTLE_MS) {
+					doIt();
+				} else if (!streamPending) {
+					streamPending = setTimeout(doIt, STREAM_THROTTLE_MS - elapsed);
+				}
+			};
+			const onChunk = (out: string, err: string) => {
+				streamBuffer.stdout = out;
+				streamBuffer.stderr = err;
+				pushStreamUpdate();
+			};
+
 			// ponytail: spinner shows liveness only; SCP has no stable byte-progress API.
 			// Use an SFTP client with byte callbacks if percentage progress is needed.
 			const spinnerTimer =
@@ -879,6 +941,7 @@ export default function (pi: ExtensionAPI): void {
 								controlPath,
 								...(loginPassword ? { loginPassword } : {}),
 								...(sig ? { signal: sig } : {}),
+								onChunk,
 							})
 						: await runSsh(spec, command, {
 								controlPath,
@@ -886,6 +949,7 @@ export default function (pi: ExtensionAPI): void {
 								sudo,
 								...(sudo ? { sudoPassword: sudoPassword ?? "" } : {}),
 								...(sig ? { signal: sig } : {}),
+								onChunk,
 							});
 			} catch (err) {
 				const msg = err instanceof Error ? err.message : String(err);
@@ -908,6 +972,7 @@ export default function (pi: ExtensionAPI): void {
 				};
 			} finally {
 				if (spinnerTimer) clearInterval(spinnerTimer);
+				if (streamPending) clearTimeout(streamPending);
 			}
 
 			if (!result) {
