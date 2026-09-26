@@ -19,6 +19,13 @@ import { globSync, readFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, resolve as resolvePath } from "node:path";
 
+/** Centralised binary/env-var names. Extracted so a custom ssh path (e.g.
+ * a Windows-distributed ssh.exe) can be wired in one place instead of 9. */
+export const SSH_BIN = "ssh";
+export const SCP_BIN = "scp";
+export const SSHPASS_BIN = "sshpass";
+export const SSHPASS_ENV = "SSHPASS";
+
 export const MAX_OUTPUT_BYTES = 50 * 1024;
 export const MAX_OUTPUT_LINES = 2000;
 
@@ -183,7 +190,12 @@ export function loadSshConfig(path: string = DEFAULT_SSH_RUN_CONFIG_PATH): SshRu
 		return DEFAULT_SSH_RUN_CONFIG;
 	}
 	const obj = parsed as Record<string, unknown>;
-	if (!("confirm" in obj)) return DEFAULT_SSH_RUN_CONFIG;
+	// Default identity / sudoConfirm-only configs are valid — fall through to
+	// the per-key parser and inherit confirm:true from the defaults. The old
+	// early-out dropped defaultIdentityFile silently (Logic #45).
+	if (!("confirm" in obj) && !("defaultIdentityFile" in obj) && !("sudoConfirm" in obj)) {
+		return DEFAULT_SSH_RUN_CONFIG;
+	}
 	if (typeof obj.confirm !== "boolean") {
 		process.stderr.write(`ssh_run: ignoring ${path} — "confirm" must be boolean\n`);
 		return DEFAULT_SSH_RUN_CONFIG;
@@ -258,6 +270,9 @@ export function parseHost(spec: string): HostSpec {
 	let port: number | undefined;
 	// IPv6 literals use brackets: [::1]:22 — only split a port off the tail
 	// when there is exactly one colon (plain host:port), leaving bare IPv6 alone.
+	// A bare IPv6 with a port (e.g. fe80::1:22) is ambiguous (last colon could
+	// be a port or part of the address) — OpenSSH requires brackets, so we
+	// accept it as the host and warn via stderr (Logic #53).
 	const colons = rest.split(":").length - 1;
 	if (rest.startsWith("[")) {
 		const end = rest.indexOf("]");
@@ -269,9 +284,18 @@ export function parseHost(spec: string): HostSpec {
 		const [h, p] = rest.split(":");
 		rest = h ?? "";
 		port = parsePort(p ?? "");
+	} else if (colons > 1) {
+		// Bare IPv6 — keep as host, no port parse (RFC requires brackets).
 	}
 
 	if (!rest) throw new Error(`Invalid host: ${spec}`);
+	// Hint when a user typed a likely-typo bare IPv6:port (fe80::1:22).
+	if (colons > 1 && rest.split(":").length > 2) {
+		process.stderr.write(
+			`ssh_run: host "${rest}" looks like a bare IPv6 with a port — ` +
+			`use [${rest}]:22 form to disambiguate\n`,
+		);
+	}
 	return { user, host: rest, ...(port !== undefined ? { port } : {}) };
 }
 
@@ -310,7 +334,7 @@ export function resolveSshHost(spec: HostSpec, signal?: AbortSignal): Promise<Ho
 
 	return new Promise((resolve) => {
 		let stdout = "";
-		const proc = spawn("ssh", args, { stdio: ["ignore", "pipe", "ignore"] });
+		const proc = spawn(SSH_BIN, args, { stdio: ["ignore", "pipe", "ignore"] });
 		proc.stdout.on("data", (chunk: Buffer) => {
 			stdout += chunk.toString();
 		});
@@ -446,7 +470,7 @@ export function resolveHostInfo(spec: HostSpec, signal?: AbortSignal): Promise<H
 	args.push(hostTarget(spec));
 	return new Promise((resolve) => {
 		let stdout = "";
-		const proc = spawn("ssh", args, { stdio: ["ignore", "pipe", "ignore"] });
+		const proc = spawn(SSH_BIN, args, { stdio: ["ignore", "pipe", "ignore"] });
 		proc.stdout.on("data", (c: Buffer) => {
 			stdout += c.toString();
 		});
@@ -651,7 +675,7 @@ export function probeKeyAuth(
 	const args = [...baseSshArgs(spec, controlPath), "-o", "BatchMode=yes", hostTarget(spec), "true"];
 	return new Promise((resolve) => {
 		let stderr = "";
-		const proc = spawn("ssh", args, { stdio: ["ignore", "ignore", "pipe"] });
+		const proc = spawn(SSH_BIN, args, { stdio: ["ignore", "ignore", "pipe"] });
 		proc.stderr.on("data", (c: Buffer) => {
 			stderr += c.toString();
 		});
@@ -699,9 +723,9 @@ export function probePasswordAuth(
 	];
 	return new Promise((resolve) => {
 		let stderr = "";
-		const proc = spawn("sshpass", args, {
+		const proc = spawn(SSHPASS_BIN, args, {
 			stdio: ["ignore", "ignore", "pipe"],
-			env: { ...process.env, SSHPASS: password },
+			env: { ...process.env, [SSHPASS_ENV]: password },
 		});
 		proc.stderr.on("data", (c: Buffer) => {
 			stderr += c.toString();
@@ -742,7 +766,7 @@ export function probeSudoNoPassword(
 		`sudo -n -- sh -c ${shellQuote(command)}`,
 	];
 	return new Promise((resolve) => {
-		const proc = spawn("ssh", args, { stdio: ["ignore", "ignore", "ignore"] });
+		const proc = spawn(SSH_BIN, args, { stdio: ["ignore", "ignore", "ignore"] });
 		proc.on("error", () => resolve(false));
 		proc.on("close", (code) => resolve(code === 0));
 		signal?.addEventListener("abort", () => proc.kill("SIGTERM"), { once: true });
@@ -787,13 +811,13 @@ export function runTransfer(
 	opts: Pick<RunOptions, "controlPath" | "loginPassword" | "signal">,
 ): Promise<SshResult> {
 	const endpoint = ["--", ...transferArgs(spec, direction, source, destination)];
-	const bin = opts.loginPassword ? "sshpass" : "scp";
+	const bin = opts.loginPassword ? SSHPASS_BIN : SCP_BIN;
 	// Same rule as runSsh: without a password in hand, force BatchMode so scp
 	// never opens its own /dev/tty prompt. sshpass path keeps prompts on.
 	const args = opts.loginPassword
 		? ["-e", "scp", ...baseScpArgs(spec, opts.controlPath, recursive), ...endpoint]
 		: [...baseScpArgs(spec, opts.controlPath, recursive), "-o", "BatchMode=yes", ...endpoint];
-	const env = opts.loginPassword ? { ...process.env, SSHPASS: opts.loginPassword } : process.env;
+	const env = opts.loginPassword ? { ...process.env, [SSHPASS_ENV]: opts.loginPassword } : process.env;
 	return spawnResult(bin, args, env, opts.signal);
 }
 
@@ -821,7 +845,7 @@ export function buildRunSshArgs(
 
 export function runSsh(spec: HostSpec, command: string, opts: RunOptions): Promise<SshResult> {
 	const { bin, args } = buildRunSshArgs(spec, command, opts);
-	const env = opts.loginPassword ? { ...process.env, SSHPASS: opts.loginPassword } : process.env;
+	const env = opts.loginPassword ? { ...process.env, [SSHPASS_ENV]: opts.loginPassword } : process.env;
 
 	// Remote sudo reads its password from stdin (first line); anything else
 	// closes stdin so the remote command sees EOF.

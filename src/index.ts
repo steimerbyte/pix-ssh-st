@@ -84,7 +84,10 @@ import {
 
 const PROMPT_TIMEOUT_MS = 60_000;
 const MAX_PASSWORD_ATTEMPTS = 3;
-const SPINNER_INTERVAL_MS = 120;
+// Spinner refresh interval — exported so tests can override it without
+// monkey-patching the module. Kept short enough for liveness but slow
+// enough to avoid burning cycles on long transfers.
+export const SPINNER_INTERVAL_MS = 120;
 
 // In-memory per-host credential cache (session-scoped, never persisted).
 // Key = canonical "user@host:port". Cleared on process exit.
@@ -313,20 +316,36 @@ function cancelResult(
 	reason: string | undefined,
 	action: OverlayResult["action"],
 ): { content: { type: "text"; text: string }[]; details: SshResultDetails } {
-	const cancellationKind: SshCancellationKind =
-		action === "timeout" ? "timeout" : action === "denied" ? "denied" : "missing-password";
-	const outcome: SshOutcome =
-		cancellationKind === "timeout"
-			? "timed-out"
-			: cancellationKind === "denied"
-				? "denied"
-				: "cancelled";
-	const msg =
-		outcome === "timed-out"
-			? "Timed out — auto-denied."
-			: outcome === "denied"
-"Denied by user or password attempts exhausted."
-"No password entered."
+	// Exhaustive switch on OverlayResult action so adding a new variant
+	// (e.g. "aborted") surfaces a TypeScript error here rather than
+	// silently falling through to the missing-password case.
+	let cancellationKind: SshCancellationKind;
+	let outcome: SshOutcome;
+	let msg: string;
+	switch (action) {
+		case "timeout":
+			cancellationKind = "timeout";
+			outcome = "timed-out";
+			msg = "Timed out — auto-denied.";
+			break;
+		case "denied":
+			cancellationKind = "denied";
+			outcome = "denied";
+			msg = "Denied by user or password attempts exhausted.";
+			break;
+		case "approved":
+			cancellationKind = "missing-password";
+			outcome = "cancelled";
+			msg = "No password entered.";
+			break;
+		default: {
+			// Exhaustiveness guard.
+			const _exhaustive: never = action;
+			cancellationKind = "missing-password";
+			outcome = "cancelled";
+			msg = `Cancelled — ${String(_exhaustive)}`;
+		}
+	}
 	return {
 		content: [{ type: "text", text: `Cancelled — ${msg}` }],
 		details: makeDetails(command, host, sudo, reason, { outcome, cancellationKind }),
